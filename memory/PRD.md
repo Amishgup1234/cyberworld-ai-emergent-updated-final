@@ -1,57 +1,64 @@
-# CyberWorld AI — Predictive Cybersecurity Command Centre
+# CyberWorld AI — Autonomous Cyber-Containment Prototype
 
-## Original Problem Statement
-User provided PDF pitch deck for CyberWorld AI (Predictive Cybersecurity Platform,
-Network Digital Twin, MITRE ATT&CK lifecycle). Started with "create a great ui/ux",
-progressed to "now make a complete working app" — full stack, real backend, real data.
+## Original problem statement
+"CyberWorld AI is an AI-powered autonomous cyber-containment prototype that detects
+suspicious network activity, automatically contains high-confidence compromised
+systems, analyzes the surrounding network for possible propagation, assigns
+threat-confidence scores to potentially affected hosts, applies configurable
+containment policies, predicts likely attack paths and targets, verifies whether
+propagation has stopped, and generates an incident report for a security engineer
+to investigate and recover affected systems."
 
-## Architecture (complete working app · 2026-01)
-- **Backend**: FastAPI + Motor (async MongoDB), single-file `/app/backend/server.py`
-  - Seeds 3 attack scenarios and 3 tenants on startup (idempotent upserts)
-  - Server-side frame computation (kill-chain probabilities, node risk escalation, edge visibility, MITRE unlock, XAI activation, target predictions, KPIs, log tail)
-  - Simulation endpoint applies mitigation deltas against peak target risk
-  - Incident bundle persistence + list per tenant
-- **Frontend**: Vite + React 18 + TypeScript, tactical cyber design system
-  - `src/api/client.ts` fully typed API client
-  - Same-origin `/api` routing (Kubernetes ingress → :8001)
-  - Dark cyber aesthetic (Chakra Petch, IBM Plex, JetBrains Mono, grain, glass, corner brackets, neon)
-- **Storage**: MongoDB (`cyberworld_ai` db): `scenarios`, `tenants`, `incidents`
+Product line: **Detect · Contain · Analyze · Verify · Report**  (supporting: Predict · Explain · Assess).
 
-## Backend Endpoints
-- `GET  /api/health` — status + scenario count
-- `GET  /api/tenants` — 3 tenants (ACME, Orbital, Fortis MSSP)
-- `GET  /api/scenarios` — list scenarios
-- `GET  /api/scenarios/{id}` — full scenario (nodes, edges, stages, mitre, xai, mitigations, target pool, log seed)
-- `GET  /api/scenarios/{id}/frame/{frame}` — computed state for that frame
-- `POST /api/simulate` — apply mitigations, return baseline + new_risk + delta
-- `POST /api/incidents` — save incident bundle (server captures snapshot)
-- `GET  /api/incidents?tenant_id=…` — list per tenant
-- `GET  /api/incidents/{id}` — retrieve
+## Architecture (current)
+- **Backend**: FastAPI + Motor · `/app/backend/server.py`
+  - Seeds 3 attack scenarios + 3 tenants + CARE settings on startup
+  - Frame-level compute: kill-chain probabilities, node risk escalation, edges, MITRE, XAI, targets, KPIs, log tail
+  - **Incident lifecycle**: Baseline → Detecting → Threat Detected → Initial Containment → Spread Analysis → Host Assessment → Secondary Containment → Verifying → Contained → Report Ready → Engineer Handoff (`max_response_cycles` bounded)
+  - **CARE engine**: policy-derived threat confidence (learned risk + graph novelty + target-ranking) → 5 actions (ISOLATE / RESTRICT / MONITOR / PROTECT / NO_ACTION), PROTECT-first for Crown Jewels + Core Identity
+  - **Auto-report** persisted idempotently when Report Ready is reached
+- **Frontend**: Vite + React 18 + TS · fully wired to `/api`, existing visual identity preserved
+- **Storage**: MongoDB — `scenarios`, `tenants`, `incidents`, `care_settings`
 
-## Scenarios seeded
-1. **Ransomware Ω-7742** — VPN→AD→SMB→PII (13 nodes, 8 stages, 5 mitigations)
-2. **Cloud Credential Heist γ-3311** — IAM abuse→S3 exfil (9 nodes, cloud-heavy)
-3. **Supply Chain Compromise λ-9018** — CI→Registry→K8s prod (8 nodes, supply chain)
+## Endpoints
+- `GET /api/health` · `GET /api/tenants` · `GET /api/scenarios` · `GET /api/scenarios/{id}`
+- `GET /api/scenarios/{id}/frame/{f}` — returns full frame state + `incident` block (lifecycle, primary suspect, affected systems with CARE decisions, care_settings)
+- `POST /api/simulate` — retained for Response Policy Lab (secondary use)
+- `POST /api/incidents` · `GET /api/incidents` · `GET /api/incidents/{id}` — manual + auto reports
+- `GET /api/care/settings` · `PUT /api/care/settings` — thresholds, verification window, protect-critical
 
-## Frontend Features
-- **Multi-tenant selector** in top bar (ACME, Orbital Health, Fortis MSSP)
-- **Multi-scenario selector** in top bar with instant twin re-render
-- **Replay Scrubber** — play/pause/step/speed(0.5×/1×/2×) driving all panels via backend fetches
-- **8 Rooms** — Overview, Twin, Forecast, XAI, MITRE, Simulate, Reports, Settings
-- **What-if Simulation** — mitigation toggles POST to `/api/simulate`, real-time baseline vs mitigated delta
-- **Save Incident** — captures scenario+frame+mitigations+snapshot to Mongo, toast confirmation
-- **Incident export** — downloads JSON bundle to disk
-- **Open incident** — reloads scenario+frame+mitigations from a saved bundle
-- **Live terminal** — server-supplied log tail keyed by frame
-- **Loading + error states** — boot spinner, backend-down banner, toast notifications
+## Rooms (all show the incident banner + IncidentBanner + KpiRow)
+- **Incident Command** — lifecycle banner, primary suspect card, affected-systems list, twin with CARE overlays, forecast, XAI, MITRE, response-policy-lab callout, engineer handoff
+- **Digital Twin** — CARE containment + response state overlaid on hosts/edges, tier breakdown, affected list
+- **Predicted Attack Path** — kill-chain trajectory with frame marker + protect-first callout
+- **Decision Explanation** — SHAP evidence + AI reasoning narrative that explains CARE actions and primary suspect
+- **MITRE ATT&CK** — unchanged content, frame-aware activation
+- **Response Policy Lab** — retained secondary what-if simulator with "estimated simulated effect — not causal proof" warning
+- **Incident Reports** — auto-generated bundles (AUTO badge) with peak risk at detection vs end, cycles, propagation status; JSON export; open (jumps to scenario+frame)
+- **CARE Policy · Settings** — 6 sliders + toggle wired to backend, live-refreshes frame state
 
-## User Personas
-- SOC Analysts · CISO / Risk Officers · Red & Blue Teams · MSSP Providers
+## Claim discipline
+Observed · Learned · Rule-derived · Graph-ranked · Simulated · Measured · Ground-truth (existing) + **Policy-derived** (new, for CARE decisions and threat-confidence scores). All containment actions labelled "replay environment / simulated lab action — no real endpoint was disconnected".
 
-## Backlog / Next Actions
-- **P1**: Playbook automation — chain mitigation toggles into named playbooks that auto-run on matching forecast patterns
-- **P1**: PDF export (currently JSON only)
-- **P2**: Real WebSocket streaming for frame progression (currently HTTP fetch per frame)
-- **P2**: Real threat intel enrichment on node hover (CVE/IOC/ASN reputation)
-- **P3**: Authentication + RBAC per tenant
-- **P3**: Historical trend charts across saved incidents
+## Assumptions honoured (from plan)
+- No auto-play on load — user presses Play (initial frame = 0)
+- All three scenarios use the new workflow
+- Automation trigger = existing early-warning condition (first host at warn/critical)
+- Threat confidence presented as policy-derived, not ML probability
+- `MAX_RESPONSE_CYCLES=3` + verification window (default 4 frames) configurable in Settings
+- Critical assets get PROTECT-first behaviour
+- Incident reports auto-assembled at Report Ready; JSON export retained
+- Top-bar "Save Incident" button retired; replaced by CARE lifecycle status chip
+- Visual identity preserved unchanged
+
+## Non-goals kept
+No auth, no real endpoint isolation, no PDF export (JSON only), no third-party SaaS, no design redesign.
+
+## Backlog
+- P1 PDF export of incident report
+- P1 Playbook automation (save mitigation toggles as named playbooks)
+- P2 WebSocket streaming for frames
+- P2 Real threat intel enrichment on hover cards
+- P3 Authentication + RBAC per tenant
+- P3 Historical trend charts across saved incidents

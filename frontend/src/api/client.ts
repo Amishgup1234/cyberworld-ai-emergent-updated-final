@@ -70,19 +70,62 @@ export type Incident = {
   id: string; scenario_id: string; scenario_name: string;
   tenant_id: string | null; frame: number; title: string;
   operator: string | null; notes: string | null;
-  mitigation_ids: string[]; created_at: string;
-  snapshot: {
-    kpis: Kpis; targets: TargetPred[]; stages: Stage[];
-    mitre_active: { tactic: string; id: string; name: string; conf: number }[];
-    xai_active: XaiSignal[]; simulation: SimResult;
-  };
+  mitigation_ids?: string[]; created_at: string;
+  auto?: boolean;
+  detection_frame?: number;
+  lifecycle?: Lifecycle;
+  primary_suspect?: PrimarySuspect | null;
+  affected_systems?: AffectedSystem[];
+  affected_counts?: Record<string, number>;
+  care_settings?: CareSettings;
+  engineer_action_required?: string;
+  snapshot: any;
 };
+
+export type Lifecycle = {
+  stage: string; cycle: number; max_cycles: number;
+  detection_frame: number; verify_start_frame: number; verify_end_frame: number;
+  verifying_progress: number; propagation_stopped: boolean; escalation_required: boolean;
+};
+
+export type PrimarySuspect = {
+  id: string; label: string; tier?: string; kind?: string; ip?: string;
+  risk: string; confidence: number;
+};
+
+export type CareAction = 'ISOLATE' | 'RESTRICT' | 'MONITOR' | 'PROTECT' | 'NO_ACTION';
+
+export type AffectedSystem = {
+  id: string; label: string; tier: string; kind: string; risk: string;
+  confidence: number; action: CareAction; reason: string;
+  critical: boolean; neighbour_of_primary: boolean;
+};
+
+export type CareSettings = {
+  detection_threshold: number;
+  isolate_threshold: number;
+  restrict_threshold: number;
+  monitor_threshold: number;
+  max_response_cycles: number;
+  verification_window_frames: number;
+  protect_critical_assets: boolean;
+};
+
+export type IncidentState = {
+  lifecycle: Lifecycle;
+  primary_suspect: PrimarySuspect | null;
+  affected_systems: AffectedSystem[];
+  affected_counts: Record<string, number>;
+  care_settings: CareSettings;
+};
+
+export type FrameStateWithIncident = FrameState & { incident: IncidentState };
 
 export const api = {
   health: () => j<{ status: string; scenarios_loaded: number }>(`${BASE}/health`),
   listScenarios: () => j<ScenarioMeta[]>(`${BASE}/scenarios`),
   getScenario: (id: string) => j<ScenarioFull>(`${BASE}/scenarios/${encodeURIComponent(id)}`),
-  getFrame: (id: string, frame: number) => j<FrameState>(`${BASE}/scenarios/${encodeURIComponent(id)}/frame/${frame}`),
+  getFrame: (id: string, frame: number) => j<FrameStateWithIncident>(`${BASE}/scenarios/${encodeURIComponent(id)}/frame/${frame}`),
   listTenants: () => j<Tenant[]>(`${BASE}/tenants`),
   simulate: (scenario_id: string, frame: number, mitigation_ids: string[]) =>
     j<SimResult>(`${BASE}/simulate`, { method: "POST", body: JSON.stringify({ scenario_id, frame, mitigation_ids }) }),
@@ -92,4 +135,7 @@ export const api = {
   }) => j<Incident>(`${BASE}/incidents`, { method: "POST", body: JSON.stringify(payload) }),
   listIncidents: (tenant_id?: string) =>
     j<Incident[]>(`${BASE}/incidents${tenant_id ? `?tenant_id=${encodeURIComponent(tenant_id)}` : ""}`),
+  getCareSettings: () => j<CareSettings>(`${BASE}/care/settings`),
+  putCareSettings: (patch: Partial<CareSettings>) =>
+    j<CareSettings>(`${BASE}/care/settings`, { method: "PUT", body: JSON.stringify(patch) }),
 };

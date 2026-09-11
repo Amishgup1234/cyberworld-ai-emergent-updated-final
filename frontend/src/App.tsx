@@ -6,10 +6,10 @@ import {
   Router as RouterIcon, HardDrive, Cloud, User, Fingerprint as FingerprintIcon, Waves,
   ChevronsRight, ShieldOff, CircleDot, Target, FileText, Settings, Play, Pause, RotateCcw,
   Rewind, FastForward, Binary, ChevronLeft, Download, ShieldCheck, BarChart3, Building2,
-  Loader2, Check, Save,
+  Loader2, Check, Crosshair, UserCheck, RefreshCw,
 } from 'lucide-react';
 import { api } from './api/client';
-import type { FrameState, Incident, Mitigation, ScenarioFull, ScenarioMeta, SimResult, Tenant } from './api/client';
+import type { AffectedSystem, CareAction, CareSettings, FrameStateWithIncident as FrameState, Incident, Mitigation, ScenarioFull, ScenarioMeta, SimResult, Tenant } from './api/client';
 
 /* =========================================================================
    Helpers
@@ -22,6 +22,33 @@ const KIND_ICON: Record<string, typeof Server> = {
 };
 const MITIGATION_ICONS: Record<string, typeof Server> = {
   ShieldOff, Ban, Lock, Binary, Fingerprint,
+};
+
+/* Lifecycle stage + CARE action colour maps */
+const LIFECYCLE_COLOR: Record<string, string> = {
+  Baseline: '#7CFFB0',
+  Detecting: '#00F0FF',
+  'Threat Detected': '#FF2E63',
+  'Initial Containment': '#FFAA00',
+  'Spread Analysis': '#00F0FF',
+  'Host Assessment': '#00F0FF',
+  'Secondary Containment': '#FFAA00',
+  Verifying: '#7C6BFF',
+  Contained: '#B6FF3D',
+  'Report Ready': '#B6FF3D',
+  'Engineer Handoff': '#FFAA00',
+};
+
+const ACTION_COLOR: Record<CareAction, string> = {
+  ISOLATE:   '#FF2E63',
+  RESTRICT:  '#FFAA00',
+  MONITOR:   '#00F0FF',
+  PROTECT:   '#B6FF3D',
+  NO_ACTION: '#4A536B',
+};
+const ACTION_LABEL: Record<CareAction, string> = {
+  ISOLATE: 'Auto-isolated', RESTRICT: 'Restricted', MONITOR: 'Monitoring',
+  PROTECT: 'Protected', NO_ACTION: 'Observing',
 };
 
 function useClock() {
@@ -101,20 +128,23 @@ function Dropdown<T extends { id: string }>({ value, options, label, icon: Icon,
   );
 }
 
-function TopBar({ conf, scenarios, scenarioId, onScenario, tenants, tenantId, onTenant, onSave, saving }: {
+function TopBar({ conf, scenarios, scenarioId, onScenario, tenants, tenantId, onTenant, lifecycleStage }: {
   conf: number; scenarios: ScenarioMeta[]; scenarioId: string | null; onScenario: (id: string) => void;
   tenants: Tenant[]; tenantId: string | null; onTenant: (id: string) => void;
-  onSave: () => void; saving: boolean;
+  lifecycleStage: string;
 }) {
   const now = useClock();
   const utc = now.toISOString().slice(11, 19);
+  const stageColor = LIFECYCLE_COLOR[lifecycleStage] || '#00F0FF';
   return (
     <div className="sticky top-0 z-40 h-[64px] border-b border-cyan-400/10 bg-[#05070C]/85 backdrop-blur-xl" data-testid="top-bar">
       <div className="h-full px-5 flex items-center justify-between gap-4">
         <div className="flex items-center gap-6 min-w-0">
           <BrandMark/>
           <div className="hidden xl:flex items-center gap-2">
-            <span className="chip"><CircleDot className="w-3 h-3 text-lime-300 blink"/>TWIN SYNCED</span>
+            <span className="chip" style={{ borderColor: `${stageColor}55`, color: stageColor }} data-testid="care-status-chip">
+              <CircleDot className="w-3 h-3 blink" style={{ color: stageColor }}/>CARE · {lifecycleStage.toUpperCase()}
+            </span>
             <span className="chip"><Cpu className="w-3 h-3 text-cyan-300"/>NODES 12,480</span>
             <span className="chip"><GitBranch className="w-3 h-3 text-violet-300"/>MODEL tw-v3.4.1</span>
           </div>
@@ -132,12 +162,6 @@ function TopBar({ conf, scenarios, scenarioId, onScenario, tenants, tenantId, on
             <Clock className="w-3.5 h-3.5 text-cyan-300"/>
             <span className="font-mono text-[11px] text-white/80">{utc} UTC</span>
           </div>
-          <button className="btn-tactical primary" onClick={onSave} disabled={saving} data-testid="btn-save-incident">
-            <span className="flex items-center gap-1.5">
-              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Save className="w-3.5 h-3.5"/>}
-              SAVE INCIDENT
-            </span>
-          </button>
         </div>
       </div>
     </div>
@@ -305,11 +329,177 @@ function KpiTile({ icon: Icon, label, value, unit, tone, trend, testid }:
 }
 
 /* =========================================================================
+   INCIDENT BANNER · PRIMARY SUSPECT · AFFECTED SYSTEMS · ENGINEER HANDOFF
+   ========================================================================= */
+
+function IncidentBanner({ state }: { state: FrameState }) {
+  const life = state.incident.lifecycle;
+  const stage = life.stage;
+  const color = LIFECYCLE_COLOR[stage] || '#00F0FF';
+  const primary = state.incident.primary_suspect;
+  const counts = state.incident.affected_counts;
+  const msg = (() => {
+    switch (stage) {
+      case 'Baseline': return 'Continuous monitoring — no elevated activity detected.';
+      case 'Detecting': return 'Temporal risk rising — CARE monitoring elevated.';
+      case 'Threat Detected': return `Threat detected on ${primary?.label || 'primary host'} — automated containment initiated.`;
+      case 'Initial Containment': return `Initial host ${primary?.label || ''} isolated in replay environment — analyzing propagation.`;
+      case 'Spread Analysis': return 'Spread analysis running across digital twin neighbours.';
+      case 'Host Assessment': return `Host assessment complete — ${counts.ISOLATE} isolate · ${counts.RESTRICT} restrict · ${counts.MONITOR} monitor · ${counts.PROTECT} protect.`;
+      case 'Secondary Containment': return 'Secondary containment applied to potentially affected systems.';
+      case 'Verifying': return `Verifying containment — window ${(life.verifying_progress * 100).toFixed(0)}%.`;
+      case 'Contained': return 'Containment successful — no further suspicious propagation observed.';
+      case 'Report Ready': return 'Incident report auto-assembled — see Reports for the full bundle.';
+      case 'Engineer Handoff': return 'Engineer handoff — investigate · remediate · recover isolated systems.';
+      default: return stage;
+    }
+  })();
+  return (
+    <div className="corners relative rounded-sm mb-5 flex items-center gap-3 px-4 py-2.5" data-testid="incident-banner"
+      style={{ background: `${color}0f`, borderColor: `${color}55`, borderWidth: 1, borderStyle: 'solid' }}>
+      <div className="cbr"></div>
+      <span className="w-2.5 h-2.5 rounded-full blink shrink-0" style={{ background: color, boxShadow: `0 0 10px ${color}` }}/>
+      <span className="font-display text-[12.5px] tracking-widest uppercase" style={{ color }}>{stage}</span>
+      <span className="text-white/40">·</span>
+      <span className="text-[13px] text-white/90 min-w-0 flex-1">{msg}</span>
+      <span className="font-mono text-[10.5px] text-white/50 hidden md:inline">Cycle {life.cycle}/{life.max_cycles} · DF F{life.detection_frame}</span>
+    </div>
+  );
+}
+
+function PrimarySuspectCard({ state }: { state: FrameState }) {
+  const p = state.incident.primary_suspect;
+  if (!p) return null;
+  const Icon = KIND_ICON[p.kind || 'server'] || Server;
+  const c = RISK_COLOR[(p.risk as Risk)] || RISK_COLOR.safe;
+  const critical = p.tier === 'Crown Jewels' || p.tier === 'Core Identity';
+  return (
+    <div className="corners relative glass rounded-sm p-4" data-testid="primary-suspect">
+      <div className="cbr"></div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2"><Crosshair className="w-4 h-4 text-rose-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">PRIMARY SUSPECT</h3></div>
+        <span className="chip" style={{ color: c, borderColor: `${c}55` }}>{(p.risk || 'safe').toUpperCase()}</span>
+      </div>
+      <div className="flex items-start gap-3">
+        <div className="w-11 h-11 rounded-sm shrink-0 flex items-center justify-center border" style={{ borderColor: `${c}66`, background: `${c}12` }}>
+          <Icon className="w-5 h-5" style={{ color: c }}/>
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-[14px] text-white font-semibold truncate">{p.label}</div>
+          <div className="font-mono text-[10.5px] text-white/45 mt-0.5">{p.id} · {p.ip || 'ip-n/a'} · {p.tier || '—'}</div>
+        </div>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <div className="rounded-sm border border-white/5 p-2">
+          <div className="font-mono text-[9.5px] tracking-[0.2em] text-white/45 uppercase">Detection conf.</div>
+          <div className="mt-1 font-display text-[20px] font-bold text-rose-300">{(p.confidence * 100).toFixed(0)}<span className="text-[12px] text-white/40">%</span></div>
+          <div className="font-mono text-[9.5px] text-white/40">policy-derived</div>
+        </div>
+        <div className="rounded-sm border border-white/5 p-2">
+          <div className="font-mono text-[9.5px] tracking-[0.2em] text-white/45 uppercase">Asset role</div>
+          <div className="mt-1 text-[13px] text-white font-medium">{critical ? 'Mission-critical' : 'Standard host'}</div>
+          <div className="font-mono text-[9.5px] text-white/40">{critical ? 'PROTECT-first policy' : 'Ladder-standard policy'}</div>
+        </div>
+      </div>
+      <div className="mt-3 rounded-sm border border-amber-400/25 bg-amber-400/5 p-2">
+        <div className="font-mono text-[9.5px] tracking-[0.18em] text-amber-300 uppercase">Suspected compromise</div>
+        <div className="text-[11.5px] text-white/75 mt-1">Simulated lab action — no real endpoint was disconnected. The original replay is immutable.</div>
+      </div>
+    </div>
+  );
+}
+
+function AffectedSystemsPanel({ state, compact = false }: { state: FrameState; compact?: boolean }) {
+  const list = state.incident.affected_systems;
+  const counts = state.incident.affected_counts;
+  return (
+    <div className="corners relative glass rounded-sm p-4" data-testid="affected-systems">
+      <div className="cbr"></div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2"><ShieldCheck className="w-4 h-4 text-lime-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">POTENTIALLY AFFECTED SYSTEMS</h3></div>
+        <div className="flex items-center gap-1">
+          {(['ISOLATE','RESTRICT','MONITOR','PROTECT','NO_ACTION'] as CareAction[]).map(k => (
+            <span key={k} className="chip" style={{ color: ACTION_COLOR[k], borderColor: `${ACTION_COLOR[k]}55` }} title={ACTION_LABEL[k]}>
+              {ACTION_LABEL[k].split(' ')[0]} {counts[k] || 0}
+            </span>
+          ))}
+        </div>
+      </div>
+      {list.length === 0 && (
+        <div className="py-6 text-center">
+          <ScanEye className="w-6 h-6 text-white/20 mx-auto mb-1.5"/>
+          <div className="text-[12.5px] text-white/50">Spread analysis will run once the threat is detected.</div>
+        </div>
+      )}
+      <div className={compact ? 'max-h-[320px] overflow-y-auto pr-1' : ''}>
+        {list.map(h => {
+          const Icon = KIND_ICON[h.kind] || Server;
+          const ac = ACTION_COLOR[h.action];
+          return (
+            <div key={h.id} className="grid grid-cols-[26px_1fr_auto] gap-3 items-center py-2 border-b border-white/5 last:border-b-0" data-testid={`affected-${h.id}`}>
+              <div className="w-7 h-7 rounded-sm border flex items-center justify-center" style={{ borderColor: `${ac}55`, background: `${ac}12` }}>
+                <Icon className="w-3.5 h-3.5" style={{ color: ac }}/>
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-[12.5px] text-white/90 font-medium truncate">{h.label}</span>
+                  {h.critical && <span className="chip !py-0" style={{ color: '#B6FF3D', borderColor: 'rgba(182,255,61,0.4)' }}>CRIT</span>}
+                </div>
+                <div className="font-mono text-[10px] text-white/40 truncate">{h.id} · {h.tier} · risk {h.risk} {h.neighbour_of_primary ? '· neighbour' : ''}</div>
+                <div className="text-[10.5px] text-white/60 mt-0.5 truncate">{h.reason}</div>
+              </div>
+              <div className="text-right">
+                <div className="font-mono text-[11px] font-bold" style={{ color: ac }}>{h.action}</div>
+                <div className="font-mono text-[10px] text-white/50">conf {(h.confidence * 100).toFixed(0)}%</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-2 font-mono text-[10px] text-white/40">Threat confidence is policy-derived (learned risk + graph novelty + target-ranking) — not a separately trained ML probability.</div>
+    </div>
+  );
+}
+
+function EngineerHandoff({ state }: { state: FrameState }) {
+  const life = state.incident.lifecycle;
+  if (life.stage !== 'Report Ready' && life.stage !== 'Engineer Handoff') return null;
+  return (
+    <div className="corners relative rounded-sm p-4 mb-5" data-testid="engineer-handoff"
+      style={{ borderColor: 'rgba(255,170,0,0.4)', borderWidth: 1, borderStyle: 'solid', background: 'rgba(255,170,0,0.05)' }}>
+      <div className="cbr"></div>
+      <div className="flex items-center gap-2 mb-2"><UserCheck className="w-4 h-4 text-amber-300"/><h3 className="font-display text-[13px] tracking-wider text-amber-200">ENGINEER HANDOFF</h3></div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <div className="font-mono text-[10px] tracking-[0.24em] text-cyan-300/70 uppercase mb-1">CyberWorld · autonomous</div>
+          <div className="font-mono text-[11.5px] text-white/85 leading-relaxed">Detect → Contain → Analyze → Respond → Verify → Report</div>
+        </div>
+        <div>
+          <div className="font-mono text-[10px] tracking-[0.24em] text-amber-300/80 uppercase mb-1">Security Engineer · human</div>
+          <div className="font-mono text-[11.5px] text-white/85 leading-relaxed">Investigate → Remediate → Recover</div>
+        </div>
+      </div>
+      <div className="mt-3 text-[12.5px] text-white/75">
+        Investigate isolated systems, perform root-cause analysis on the primary suspect, review credentials, patch and remediate impacted hosts, recover from clean backups. Simulated lab actions — no real endpoints were disconnected.
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
    TWIN CANVAS
    ========================================================================= */
 
 function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: FrameState; hovered: string | null; setHovered: (id: string | null) => void; compact?: boolean; }) {
   const nodeById = useMemo(() => Object.fromEntries(state.nodes.map(n => [n.id, n])), [state.nodes]);
+  const primaryId = state.incident.primary_suspect?.id || null;
+  const actionByHost = useMemo(() => {
+    const m: Record<string, CareAction> = {};
+    for (const h of state.incident.affected_systems) m[h.id] = h.action;
+    return m;
+  }, [state.incident.affected_systems]);
+  const lifecycleStage = state.incident.lifecycle.stage;
+  const containmentActive = !['Baseline','Detecting','Threat Detected'].includes(lifecycleStage);
   return (
     <div className="corners relative glass rounded-sm overflow-hidden" data-testid="twin-canvas">
       <div className="cbr"></div>
@@ -320,7 +510,7 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
           <span className="chip"><CircleDot className="w-2.5 h-2.5 text-lime-300 blink"/>LIVE · F{String(state.frame).padStart(2,'0')}</span>
         </div>
         <div className="flex items-center gap-1.5">
-          {['All','Critical','Targeted','Isolated'].map((f, i) => (
+          {(['All','Critical','Targeted','Isolated'] as const).map((f, i) => (
             <button key={f} data-testid={`twin-filter-${f.toLowerCase()}`} className={`px-2.5 py-1 font-mono text-[10.5px] tracking-wider rounded-sm border ${i === 1 ? 'bg-rose-500/15 border-rose-400/40 text-rose-200' : 'border-white/10 text-white/55 hover:text-white'}`}>{f.toUpperCase()}</button>
           ))}
         </div>
@@ -338,12 +528,20 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
             const a = nodeById[e.from]; const b = nodeById[e.to]; if (!a || !b) return null;
             const grad = e.malicious ? 'url(#grad-rose)' : 'url(#grad-cyan)';
             const stroke = e.malicious ? '#FF2E63' : e.predicted ? '#7C6BFF' : '#00F0FF';
-            const opacity = e.visible ? 0.35 + e.intensity * 0.5 : 0.06;
+            // If containment is active and this edge touches the primary (or an ISOLATED host), mute it
+            const touchesIsolated = containmentActive && (
+              e.from === primaryId || e.to === primaryId ||
+              actionByHost[e.from] === 'ISOLATE' || actionByHost[e.to] === 'ISOLATE'
+            );
+            const opacity = !e.visible ? 0.06 : touchesIsolated ? 0.18 : 0.35 + e.intensity * 0.5;
             return (
               <g key={i}>
                 <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={grad} strokeWidth={1 + e.intensity * 2} opacity={opacity}/>
-                {(e.malicious || e.predicted) && e.visible && (
+                {(e.malicious || e.predicted) && e.visible && !touchesIsolated && (
                   <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={stroke} strokeWidth={1.4} strokeDasharray="6 6" className="flow-dash" opacity={0.9}/>
+                )}
+                {touchesIsolated && e.visible && (
+                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="#FF2E63" strokeWidth={1} strokeDasharray="2 4" opacity={0.35}/>
                 )}
               </g>
             );
@@ -351,16 +549,37 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
           {state.nodes.map(n => {
             const r = n.risk as Risk;
             const c = RISK_COLOR[r] || RISK_COLOR.safe;
+            const action = actionByHost[n.id];
+            const isPrimary = n.id === primaryId && containmentActive;
             const isHover = hovered === n.id;
             const rad = isHover ? 15 : 12;
+            const stateColor = isPrimary ? '#FF2E63' : (action && action !== 'NO_ACTION' ? ACTION_COLOR[action] : c);
             return (
               <g key={n.id} onMouseEnter={() => setHovered(n.id)} onMouseLeave={() => setHovered(null)} style={{ cursor: 'pointer' }} data-testid={`twin-node-${n.id}`}>
                 <circle cx={n.x} cy={n.y} r={26} fill={c} opacity={0.10}/>
-                {r === 'critical' && <circle cx={n.x} cy={n.y} r={rad + 6} fill="none" stroke={c} strokeWidth={1} className="pulse-ring"/>}
-                <circle cx={n.x} cy={n.y} r={rad} fill="#05070C" stroke={c} strokeWidth={1.6}/>
-                <circle cx={n.x} cy={n.y} r={4} fill={c}/>
+                {isPrimary && <circle cx={n.x} cy={n.y} r={rad + 8} fill="none" stroke="#FF2E63" strokeWidth={1.4} className="pulse-ring"/>}
+                {r === 'critical' && !isPrimary && <circle cx={n.x} cy={n.y} r={rad + 6} fill="none" stroke={c} strokeWidth={1} className="pulse-ring"/>}
+                {/* CARE ring — outer response state indicator */}
+                {action && action !== 'NO_ACTION' && !isPrimary && (
+                  <circle cx={n.x} cy={n.y} r={rad + 4} fill="none" stroke={ACTION_COLOR[action]} strokeWidth={1.5} strokeDasharray={action === 'MONITOR' ? '2 3' : action === 'RESTRICT' ? '4 3' : action === 'PROTECT' ? '6 2' : '0'} opacity={0.85}/>
+                )}
+                <circle cx={n.x} cy={n.y} r={rad} fill="#05070C" stroke={stateColor} strokeWidth={isPrimary ? 2.2 : 1.6}/>
+                <circle cx={n.x} cy={n.y} r={4} fill={stateColor}/>
+                {/* Action badge */}
+                {action && action !== 'NO_ACTION' && !isPrimary && (
+                  <g>
+                    <rect x={n.x + 10} y={n.y - 22} width={action.length * 5.2 + 8} height={11} rx={2} fill={ACTION_COLOR[action]} opacity={0.16} stroke={ACTION_COLOR[action]} strokeWidth={0.6}/>
+                    <text x={n.x + 14} y={n.y - 14} fontSize="7" fontFamily="JetBrains Mono" fill={ACTION_COLOR[action]}>{action}</text>
+                  </g>
+                )}
+                {isPrimary && (
+                  <g>
+                    <rect x={n.x - 30} y={n.y - 22} width={60} height={11} rx={2} fill="#FF2E63" opacity={0.16} stroke="#FF2E63" strokeWidth={0.6}/>
+                    <text x={n.x} y={n.y - 14} fontSize="7" fontFamily="JetBrains Mono" fill="#FF2E63" textAnchor="middle">SUSPECT</text>
+                  </g>
+                )}
                 <text x={n.x} y={n.y + 30} textAnchor="middle" fill="#E9F0FF" fontSize="9.5" fontFamily="JetBrains Mono" opacity={0.72}>{n.label}</text>
-                <text x={n.x} y={n.y + 42} textAnchor="middle" fill={c} fontSize="8" fontFamily="JetBrains Mono" opacity={0.55}>{n.ip}</text>
+                <text x={n.x} y={n.y + 42} textAnchor="middle" fill={stateColor} fontSize="8" fontFamily="JetBrains Mono" opacity={0.55}>{n.ip}</text>
               </g>
             );
           })}
@@ -371,6 +590,7 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
               const n = nodeById[hovered];
               const Icon = KIND_ICON[n.kind] || Server;
               const r = n.risk as Risk;
+              const action = actionByHost[n.id];
               return (
                 <>
                   <div className="flex items-center justify-between">
@@ -379,18 +599,22 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
                   </div>
                   <div className="mt-2 font-mono text-[10.5px] text-white/60 space-y-0.5">
                     <div>ID   {n.id}</div><div>IP   {n.ip}</div><div>TIER {n.tier}</div><div>KIND {n.kind}</div>
+                    {action && <div>CARE <span style={{ color: ACTION_COLOR[action] }}>{action}</span></div>}
+                    {n.id === primaryId && containmentActive && <div className="text-rose-300">PRIMARY SUSPECT</div>}
                   </div>
                 </>
               );
             })()}
           </div>
         )}
-        <div className="absolute bottom-3 left-3 glass rounded-sm px-3 py-2 flex items-center gap-4 flex-wrap">
+        <div className="absolute bottom-3 left-3 glass rounded-sm px-3 py-2 flex items-center gap-4 flex-wrap max-w-[calc(100%-24px)]">
           {(['safe','watch','warn','critical'] as Risk[]).map(r => (
             <div key={r} className="flex items-center gap-1.5 font-mono text-[10px] text-white/60 uppercase"><span className="w-2 h-2 rounded-full" style={{ background: RISK_COLOR[r] }}/>{r}</div>
           ))}
-          <div className="pl-3 ml-1 border-l border-white/10 flex items-center gap-2 font-mono text-[10px] text-white/60 uppercase">
-            <span className="w-4 h-[2px] bg-rose-400"/>Malicious <span className="w-4 h-[2px] bg-violet-400 ml-2"/>Predicted
+          <div className="pl-3 ml-1 border-l border-white/10 flex items-center gap-3 font-mono text-[10px] text-white/60 uppercase flex-wrap">
+            {(['ISOLATE','RESTRICT','MONITOR','PROTECT'] as CareAction[]).map(a => (
+              <span key={a} className="flex items-center gap-1"><span className="w-3 h-3 rounded-full border" style={{ borderColor: ACTION_COLOR[a] }}/>{a}</span>
+            ))}
           </div>
         </div>
       </div>
@@ -680,14 +904,14 @@ function TargetSegments() {
 
 function SectionHead({ nav, setNav, frame, scenarioName }: { nav: NavId; setNav: (n: NavId) => void; frame: number; scenarioName?: string; }) {
   const meta: Record<NavId, { title: string; sub: string; icon: typeof Server; tone: string }> = {
-    overview: { title: 'Command Overview',   sub: 'Full situational picture across the predictive stack', icon: Radar, tone: '#00F0FF' },
-    twin:     { title: 'Digital Twin',       sub: 'Continuously synchronised graph of hosts, flows and risk', icon: Network, tone: '#00F0FF' },
-    forecast: { title: 'Attack Forecast',    sub: 'Kill-chain probability trajectory across the MITRE lifecycle', icon: TrendingUp, tone: '#7C6BFF' },
-    xai:      { title: 'Explainable AI',     sub: 'Behavioural evidence and feature contributions behind each prediction', icon: BrainCircuit, tone: '#B6FF3D' },
-    mitre:    { title: 'MITRE ATT&CK',       sub: 'Observed & predicted techniques mapped to v13.1', icon: ScanEye, tone: '#00F0FF' },
-    simulate: { title: 'What-if Simulate',   sub: 'Test mitigations virtually before touching production', icon: Sparkles, tone: '#7C6BFF' },
-    reports:  { title: 'Incident Reports',   sub: 'Saved bundles ready for SOC handoff and board readout', icon: FileText, tone: '#FFAA00' },
-    settings: { title: 'Settings',           sub: 'Sensors, integrations, and model preferences', icon: Settings, tone: '#FFAA00' },
+    overview: { title: 'Incident Command',       sub: 'Detect · Contain · Analyze · Verify · Report — full autonomous response picture', icon: Radar, tone: '#00F0FF' },
+    twin:     { title: 'Digital Twin',           sub: 'Continuously synchronised graph — CARE containment and response state overlaid on hosts and edges', icon: Network, tone: '#00F0FF' },
+    forecast: { title: 'Predicted Attack Path',  sub: 'Kill-chain trajectory and likely next targets used for proactive protection', icon: TrendingUp, tone: '#7C6BFF' },
+    xai:      { title: 'Decision Explanation',   sub: 'Why hosts were detected, isolated, restricted, monitored or protected — policy-derived reasoning', icon: BrainCircuit, tone: '#B6FF3D' },
+    mitre:    { title: 'MITRE ATT&CK',           sub: 'Observed & predicted techniques mapped to v13.1', icon: ScanEye, tone: '#00F0FF' },
+    simulate: { title: 'Response Policy Lab',    sub: 'Secondary what-if inspection — estimate simulated effect of manual mitigation combinations', icon: Sparkles, tone: '#7C6BFF' },
+    reports:  { title: 'Incident Reports',       sub: 'Auto-generated bundles ready for security-engineer handoff', icon: FileText, tone: '#FFAA00' },
+    settings: { title: 'CARE Policy · Settings', sub: 'Autonomous response thresholds, verification window and cycle bounds', icon: Settings, tone: '#FFAA00' },
   };
   const m = meta[nav]; const Icon = m.icon;
   const order: NavId[] = ['overview','twin','forecast','xai','mitre','simulate','reports','settings'];
@@ -701,7 +925,7 @@ function SectionHead({ nav, setNav, frame, scenarioName }: { nav: NavId; setNav:
         <h1 className="mt-2 font-display text-[30px] lg:text-[38px] leading-[1.05] font-bold tracking-tight text-white flex items-center gap-3">
           <Icon className="w-8 h-8" style={{ color: m.tone }}/>{m.title}
         </h1>
-        <p className="mt-2 max-w-[640px] text-[13px] text-white/55 leading-relaxed">{m.sub}</p>
+        <p className="mt-2 max-w-[720px] text-[13px] text-white/55 leading-relaxed">{m.sub}</p>
       </div>
       <div className="flex items-center gap-2">
         <button className="btn-tactical" onClick={() => setNav(order[Math.max(0, idx - 1)])} data-testid="btn-prev-room"><span className="flex items-center gap-1.5"><ChevronLeft className="w-3.5 h-3.5"/>PREV</span></button>
@@ -733,22 +957,30 @@ function OverviewRoom({ state, scenario, hovered, setHovered, activeMitigations,
 }) {
   return (
     <>
+      <IncidentBanner state={state}/>
       <KpiRow state={state}/>
+      <EngineerHandoff state={state}/>
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
         <div className="xl:col-span-2 min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered}/></div>
-        <div className="min-w-0"><ForecastRail state={state}/></div>
+        <div className="min-w-0 flex flex-col gap-5">
+          <PrimarySuspectCard state={state}/>
+          <ForecastRail state={state}/>
+        </div>
       </div>
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
-        <div className="xl:col-span-2 min-w-0"><MitreMatrix state={state}/></div>
+        <div className="xl:col-span-2 min-w-0"><AffectedSystemsPanel state={state}/></div>
         <div className="min-w-0"><XaiPanel state={state}/></div>
       </div>
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
-        <div className="xl:col-span-2 min-w-0"><SimulationPanel scenario={scenario} frame={state.frame} activeMitigations={activeMitigations} setActiveMitigations={setActiveMitigations} sim={sim}/></div>
+        <div className="xl:col-span-2 min-w-0"><MitreMatrix state={state}/></div>
         <div className="min-w-0"><TargetSegments/></div>
       </div>
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
-        <div className="xl:col-span-2 min-w-0"><LiveTerminal state={state}/></div>
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
+        <div className="xl:col-span-2 min-w-0"><SimulationPanel scenario={scenario} frame={state.frame} activeMitigations={activeMitigations} setActiveMitigations={setActiveMitigations} sim={sim}/></div>
         <div className="min-w-0"><RoadmapStrip/></div>
+      </div>
+      <div className="grid grid-cols-1 gap-5">
+        <div className="min-w-0"><LiveTerminal state={state}/></div>
       </div>
     </>
   );
@@ -757,13 +989,14 @@ function OverviewRoom({ state, scenario, hovered, setHovered, activeMitigations,
 function TwinRoom({ state, hovered, setHovered }: { state: FrameState; hovered: string | null; setHovered: (s: string | null) => void }) {
   return (
     <>
+      <IncidentBanner state={state}/>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
         <KpiTile icon={Network}       label="Nodes Tracked"  value={state.kpis.twin_nodes.toLocaleString()} tone="cyan"   trend={`${state.kpis.twin_edges.toLocaleString()} edges`} testid="kpi-nodes-twin"/>
         <KpiTile icon={ShieldAlert}   label="Critical Nodes" value={String(state.kpis.critical_nodes)}      tone="rose"   trend="Crown jewels at risk" testid="kpi-critical-nodes"/>
         <KpiTile icon={AlertTriangle} label="Warn Nodes"     value={String(state.kpis.warn_nodes)}          tone="amber"  trend="Elevated observation" testid="kpi-warn-nodes"/>
         <KpiTile icon={ShieldCheck}   label="Twin Fidelity"  value={state.kpis.twin_fidelity.toFixed(1)}    unit="%" tone="lime" trend="drift < 0.02 rmse" testid="kpi-fidelity"/>
       </div>
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
         <div className="xl:col-span-2 min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered}/></div>
         <div className="min-w-0 flex flex-col gap-5">
           <div className="corners relative glass rounded-sm p-4" data-testid="tier-breakdown">
@@ -779,9 +1012,11 @@ function TwinRoom({ state, hovered, setHovered }: { state: FrameState; hovered: 
               );
             })}
           </div>
-          <LiveTerminal state={state}/>
+          <PrimarySuspectCard state={state}/>
         </div>
       </div>
+      <div className="mb-5"><AffectedSystemsPanel state={state}/></div>
+      <LiveTerminal state={state}/>
     </>
   );
 }
@@ -789,11 +1024,12 @@ function TwinRoom({ state, hovered, setHovered }: { state: FrameState; hovered: 
 function ForecastRoom({ state }: { state: FrameState }) {
   return (
     <>
+      <IncidentBanner state={state}/>
       <KpiRow state={state}/>
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
         <div className="xl:col-span-2 corners relative glass rounded-sm p-4" data-testid="killchain-timeline">
           <div className="cbr"></div>
-          <div className="flex items-center justify-between mb-4"><div className="flex items-center gap-2"><BarChart3 className="w-4 h-4 text-violet-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">KILL-CHAIN PROBABILITY TRAJECTORY</h3></div><span className="chip">Frame F{String(state.frame).padStart(2,'0')} · {state.frame_count} total</span></div>
+          <div className="flex items-center justify-between mb-4"><div className="flex items-center gap-2"><BarChart3 className="w-4 h-4 text-violet-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">PREDICTED ATTACK PATH · KILL-CHAIN TRAJECTORY</h3></div><span className="chip">Frame F{String(state.frame).padStart(2,'0')} · {state.frame_count} total</span></div>
           <div className="space-y-3">
             {state.stages.map(s => (
               <div key={s.stage} className="grid grid-cols-[140px_1fr_60px] gap-3 items-center">
@@ -807,6 +1043,7 @@ function ForecastRoom({ state }: { state: FrameState }) {
               </div>
             ))}
           </div>
+          <div className="mt-4 font-mono text-[10.5px] text-white/45">Predicted next targets can be marked <span style={{ color: ACTION_COLOR.PROTECT }}>PROTECT</span> — critical assets are preserved, suspicious paths restricted, monitoring heightened rather than blindly disconnected.</div>
         </div>
         <div className="min-w-0"><ForecastRail state={state}/></div>
       </div>
@@ -818,26 +1055,188 @@ function ForecastRoom({ state }: { state: FrameState }) {
 function XaiRoom({ state }: { state: FrameState }) {
   const strongestTarget = state.targets[0]?.host || 'target';
   const eta = state.targets[0]?.eta_min ?? 0;
+  const primary = state.incident.primary_suspect;
+  const topAction = state.incident.affected_systems.find(h => h.action !== 'NO_ACTION');
   return (
     <>
+      <IncidentBanner state={state}/>
       <KpiRow state={state}/>
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-5">
         <XaiPanel state={state}/>
         <div className="corners relative glass rounded-sm p-4" data-testid="reasoning-panel">
           <div className="cbr"></div>
-          <div className="flex items-center gap-2 mb-3"><BrainCircuit className="w-4 h-4 text-lime-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">AI REASONING NARRATIVE</h3></div>
+          <div className="flex items-center gap-2 mb-3"><BrainCircuit className="w-4 h-4 text-lime-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">DECISION EXPLANATION</h3></div>
           <div className="space-y-3 text-[12.5px] text-white/75 leading-relaxed">
             <p>At <span className="font-mono text-cyan-300">F{String(state.frame).padStart(2,'0')}</span>, temporal model <span className="font-mono text-cyan-300">tw-v3.4.1</span> reports {state.xai.filter(s => s.active).length} active behavioural signals.</p>
-            {state.xai.filter(s => s.active).slice(0, 3).map((s, i) => (
-              <p key={i} className="pl-3 border-l-2" style={{ borderColor: i === 0 ? 'rgba(182,255,61,0.4)' : i === 1 ? 'rgba(255,170,0,0.4)' : 'rgba(255,46,99,0.4)' }}>
-                {i === 0 ? 'Primary' : i === 1 ? 'Secondary' : 'Tertiary'} contributor: <span className="text-white">{s.name}</span>. {s.context}.
+            {state.xai.filter(s => s.active).slice(0, 2).map((s, i) => (
+              <p key={i} className="pl-3 border-l-2" style={{ borderColor: i === 0 ? 'rgba(182,255,61,0.4)' : 'rgba(255,170,0,0.4)' }}>
+                {i === 0 ? 'Primary' : 'Secondary'} contributor: <span className="text-white">{s.name}</span>. {s.context}.
               </p>
             ))}
-            <p className="pt-2 border-t border-white/5">Model projects escalation toward <span className="text-white">{strongestTarget}</span> with predicted lead time of <span className="font-mono text-rose-300">{eta} min</span>.</p>
+            {primary && (
+              <p className="pl-3 border-l-2" style={{ borderColor: 'rgba(255,46,99,0.4)' }}>
+                CARE selected <span className="text-white">{primary.label}</span> as primary suspect (policy-derived conf {(primary.confidence * 100).toFixed(0)}%) — automatic initial containment applied.
+              </p>
+            )}
+            {topAction && (
+              <p className="pl-3 border-l-2" style={{ borderColor: `${ACTION_COLOR[topAction.action]}66` }}>
+                Highest-impact secondary action: <span className="text-white">{topAction.label}</span> → <span style={{ color: ACTION_COLOR[topAction.action] }}>{topAction.action}</span>. Reason: {topAction.reason}
+              </p>
+            )}
+            <p className="pt-2 border-t border-white/5">Model projects escalation toward <span className="text-white">{strongestTarget}</span> with predicted lead time of <span className="font-mono text-rose-300">{eta} min</span>. Threat confidence values shown above are <span className="text-white">policy-derived</span>, not a separately trained ML probability.</p>
           </div>
         </div>
       </div>
       <LiveTerminal state={state}/>
+    </>
+  );
+}
+
+function SimulateRoom({ state, scenario, hovered, setHovered, activeMitigations, setActiveMitigations, sim }: {
+  state: FrameState; scenario: ScenarioFull; hovered: string | null; setHovered: (s: string | null) => void;
+  activeMitigations: Record<string, boolean>; setActiveMitigations: (u: (p: Record<string, boolean>) => Record<string, boolean>) => void; sim: SimResult | null;
+}) {
+  return (
+    <>
+      <IncidentBanner state={state}/>
+      <div className="rounded-sm border p-3 mb-5" style={{ borderColor: 'rgba(255,170,0,0.35)', background: 'rgba(255,170,0,0.05)' }} data-testid="policy-lab-warning">
+        <div className="flex items-center gap-2 mb-1"><AlertTriangle className="w-3.5 h-3.5 text-amber-300"/><span className="font-mono text-[10.5px] tracking-[0.24em] text-amber-200 uppercase">Response Policy Lab · secondary use</span></div>
+        <div className="text-[12px] text-white/75">The primary containment flow is fully autonomous via CARE. This lab lets analysts inspect <span className="text-white">estimated simulated effect</span> of manual mitigation combinations — not causal proof of real-world outcomes.</div>
+      </div>
+      <KpiRow state={state}/>
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-5">
+        <SimulationPanel scenario={scenario} frame={state.frame} activeMitigations={activeMitigations} setActiveMitigations={setActiveMitigations} sim={sim}/>
+        <div className="min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered} compact/></div>
+      </div>
+      <LiveTerminal state={state}/>
+    </>
+  );
+}
+
+function ReportsRoom({ state, incidents, onExport, onJumpTo, onRefresh }: {
+  state: FrameState; incidents: Incident[]; onExport: (id: string) => void; onJumpTo: (inc: Incident) => void; onRefresh: () => void;
+}) {
+  return (
+    <>
+      <IncidentBanner state={state}/>
+      <KpiRow state={state}/>
+      <EngineerHandoff state={state}/>
+      <div className="corners relative glass rounded-sm p-4 mb-5" data-testid="reports-list">
+        <div className="cbr"></div>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2"><FileText className="w-4 h-4 text-amber-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">AUTO-GENERATED INCIDENT REPORTS</h3></div>
+          <div className="flex items-center gap-2">
+            <span className="chip">{incidents.length} bundles</span>
+            <button className="btn-tactical !py-1.5 !px-2" onClick={onRefresh} data-testid="btn-refresh-incidents"><RefreshCw className="w-3.5 h-3.5"/></button>
+          </div>
+        </div>
+        {incidents.length === 0 && (
+          <div className="py-8 text-center">
+            <FileText className="w-8 h-8 text-white/20 mx-auto mb-2"/>
+            <div className="text-[13px] text-white/50">No incidents yet.</div>
+            <div className="font-mono text-[10.5px] text-white/35 mt-1">CyberWorld will auto-assemble a report once the verification window completes successfully.</div>
+          </div>
+        )}
+        {incidents.map((it) => {
+          const auto = !!it.auto;
+          const rm = it.snapshot?.response_metrics;
+          const life = it.lifecycle;
+          return (
+            <div key={it.id} className="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5 last:border-b-0" data-testid={`incident-${it.id}`}>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] text-white/90 truncate">{it.title}</span>
+                  {auto && <span className="chip !py-0" style={{ color: '#B6FF3D', borderColor: 'rgba(182,255,61,0.4)' }}>AUTO</span>}
+                </div>
+                <div className="font-mono text-[10.5px] text-white/40 mt-0.5">
+                  {it.id} · {it.scenario_name} · F{String(it.frame).padStart(2,'0')} · {new Date(it.created_at).toLocaleString()}
+                </div>
+                <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                  {rm ? (
+                    <>
+                      <span className="chip"><CircleDot className="w-2.5 h-2.5 text-rose-300"/>Peak risk @detect {(rm.peak_risk_at_detection * 100).toFixed(0)}%</span>
+                      <span className="chip"><ShieldCheck className="w-2.5 h-2.5 text-lime-300"/>@end {(rm.peak_risk_at_end * 100).toFixed(0)}%</span>
+                      <span className="chip"><TrendingUp className="w-2.5 h-2.5 text-cyan-300"/>Cycles {rm.cycles_used}</span>
+                      <span className="chip"><Check className="w-2.5 h-2.5 text-lime-300"/>{rm.propagation_stopped ? 'Contained' : 'Escalated'}</span>
+                    </>
+                  ) : (
+                    <span className="chip"><FileText className="w-2.5 h-2.5"/>Manual snapshot</span>
+                  )}
+                  {life && <span className="chip">Stage: {life.stage}</span>}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button className="btn-tactical !py-1.5" onClick={() => onJumpTo(it)} data-testid={`incident-jump-${it.id}`}><span className="flex items-center gap-1.5"><Eye className="w-3.5 h-3.5"/>OPEN</span></button>
+                <button className="btn-tactical !py-1.5" onClick={() => onExport(it.id)} data-testid={`incident-export-${it.id}`}><span className="flex items-center gap-1.5"><Download className="w-3.5 h-3.5"/>EXPORT</span></button>
+              </div>
+            </div>
+          );
+        })}
+        <div className="mt-3 font-mono text-[10px] text-white/40">Reports are auto-assembled once the verification window closes successfully. JSON export includes the primary suspect, affected systems with CARE decisions, before/after response metrics, and engineer action required.</div>
+      </div>
+    </>
+  );
+}
+
+function SettingsRoom({ state, scenario, care, onCarePatch }: { state: FrameState; scenario: ScenarioFull; care: CareSettings | null; onCarePatch: (p: Partial<CareSettings>) => void }) {
+  const c = care;
+  const row = (label: string, key: keyof CareSettings, min: number, max: number, step: number, unit = '') => c && (
+    <div className="py-2 border-b border-white/5 last:border-b-0" data-testid={`care-${String(key)}`}>
+      <div className="flex items-center justify-between">
+        <span className="text-[12.5px] text-white/85">{label}</span>
+        <span className="font-mono text-[11px] text-cyan-300">{(c[key] as number).toFixed(step < 1 ? 2 : 0)}{unit}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={c[key] as number}
+        onChange={(e) => onCarePatch({ [key]: parseFloat(e.target.value) } as Partial<CareSettings>)}
+        className="w-full mt-1.5 accent-cyan-400"/>
+    </div>
+  );
+  return (
+    <>
+      <IncidentBanner state={state}/>
+      <KpiRow state={state}/>
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+        <div className="corners relative glass rounded-sm p-4">
+          <div className="cbr"></div>
+          <div className="flex items-center gap-2 mb-3"><Settings className="w-4 h-4 text-amber-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">CARE POLICY THRESHOLDS</h3></div>
+          {row('Detection threshold', 'detection_threshold', 0.4, 0.9, 0.05)}
+          {row('Auto-isolate threshold', 'isolate_threshold', 0.6, 1.0, 0.05)}
+          {row('Restrict threshold', 'restrict_threshold', 0.4, 0.95, 0.05)}
+          {row('Monitor threshold', 'monitor_threshold', 0.2, 0.9, 0.05)}
+          {row('Max response cycles', 'max_response_cycles', 1, 5, 1, '×')}
+          {row('Verification window (frames)', 'verification_window_frames', 2, 10, 1, ' f')}
+          {c && (
+            <div className="mt-2 flex items-center justify-between py-2">
+              <span className="text-[12.5px] text-white/85">Protect critical assets first</span>
+              <button data-testid="care-protect-toggle" onClick={() => onCarePatch({ protect_critical_assets: !c.protect_critical_assets })}
+                className={`w-10 h-5 rounded-full relative ${c.protect_critical_assets ? 'bg-lime-300/40' : 'bg-white/10'}`}>
+                <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white" style={{ left: c.protect_critical_assets ? '22px' : '2px', transition: 'left 200ms ease' }}/>
+              </button>
+            </div>
+          )}
+          <div className="mt-2 font-mono text-[10px] text-white/40">Prototype-level deterministic values — not enterprise policy. Threat confidence is policy-derived.</div>
+        </div>
+        <div className="corners relative glass rounded-sm p-4">
+          <div className="cbr"></div>
+          <div className="flex items-center gap-2 mb-3"><BrainCircuit className="w-4 h-4 text-cyan-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">MODEL & SCENARIO</h3></div>
+          {[
+            { k: 'Model checkpoint',   v: 'tw-v3.4.1' },
+            { k: 'Feature schema',     v: 'phase03-v1-sealed · 80 features' },
+            { k: 'Temporal window',    v: '5 frames EWMA' },
+            { k: 'Threshold',          v: '0.45' },
+            { k: 'Explanation method', v: 'SHAP contribution' },
+            { k: 'Scenario id',        v: scenario.id },
+            { k: 'Scenario seed',      v: '42' },
+            { k: 'Total frames',       v: String(state.frame_count) },
+            { k: 'Detection frame',    v: `F${state.incident.lifecycle.detection_frame}` },
+          ].map((r) => (
+            <div key={r.k} className="flex items-center justify-between py-2 border-b border-white/5 last:border-b-0">
+              <span className="text-[12.5px] text-white/70">{r.k}</span>
+              <span className="font-mono text-[11px] text-cyan-300">{r.v}</span>
+            </div>
+          ))}
+        </div>
+      </div>
     </>
   );
 }
@@ -868,104 +1267,9 @@ function MitreRoom({ state }: { state: FrameState }) {
   );
 }
 
-function SimulateRoom({ state, scenario, hovered, setHovered, activeMitigations, setActiveMitigations, sim }: {
-  state: FrameState; scenario: ScenarioFull; hovered: string | null; setHovered: (s: string | null) => void;
-  activeMitigations: Record<string, boolean>; setActiveMitigations: (u: (p: Record<string, boolean>) => Record<string, boolean>) => void; sim: SimResult | null;
-}) {
-  return (
-    <>
-      <KpiRow state={state}/>
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-5">
-        <SimulationPanel scenario={scenario} frame={state.frame} activeMitigations={activeMitigations} setActiveMitigations={setActiveMitigations} sim={sim}/>
-        <div className="min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered} compact/></div>
-      </div>
-      <LiveTerminal state={state}/>
-    </>
-  );
-}
-
-function ReportsRoom({ state, incidents, onExport, onJumpTo }: {
-  state: FrameState; incidents: Incident[]; onExport: (id: string) => void; onJumpTo: (inc: Incident) => void;
-}) {
-  return (
-    <>
-      <KpiRow state={state}/>
-      <div className="corners relative glass rounded-sm p-4 mb-5" data-testid="reports-list">
-        <div className="cbr"></div>
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2"><FileText className="w-4 h-4 text-amber-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">SAVED INCIDENTS</h3></div>
-          <span className="chip">{incidents.length} bundles</span>
-        </div>
-        {incidents.length === 0 && (
-          <div className="py-8 text-center">
-            <FileText className="w-8 h-8 text-white/20 mx-auto mb-2"/>
-            <div className="text-[13px] text-white/50">No incidents saved yet.</div>
-            <div className="font-mono text-[10.5px] text-white/35 mt-1">Use the SAVE INCIDENT button in the top bar to capture the current frame as a shareable bundle.</div>
-          </div>
-        )}
-        {incidents.map((it) => (
-          <div key={it.id} className="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5 last:border-b-0" data-testid={`incident-${it.id}`}>
-            <div className="min-w-0">
-              <div className="text-[13px] text-white/90 truncate">{it.title}</div>
-              <div className="font-mono text-[10.5px] text-white/40 mt-0.5">
-                {it.id} · {it.scenario_name} · F{String(it.frame).padStart(2,'0')} · {new Date(it.created_at).toLocaleString()}
-              </div>
-              <div className="mt-1.5 flex items-center gap-2 flex-wrap">
-                <span className="chip"><ShieldAlert className="w-2.5 h-2.5 text-rose-300"/>Baseline {(it.snapshot.simulation.baseline_risk * 100).toFixed(0)}%</span>
-                <span className="chip"><ShieldCheck className="w-2.5 h-2.5 text-lime-300"/>Mitigated {(it.snapshot.simulation.new_risk * 100).toFixed(0)}%</span>
-                <span className="chip"><ScanEye className="w-2.5 h-2.5 text-cyan-300"/>{it.snapshot.mitre_active.length} techniques</span>
-                <span className="chip"><BrainCircuit className="w-2.5 h-2.5 text-lime-300"/>{it.snapshot.xai_active.length} signals</span>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <button className="btn-tactical !py-1.5" onClick={() => onJumpTo(it)} data-testid={`incident-jump-${it.id}`}><span className="flex items-center gap-1.5"><Eye className="w-3.5 h-3.5"/>OPEN</span></button>
-              <button className="btn-tactical !py-1.5" onClick={() => onExport(it.id)} data-testid={`incident-export-${it.id}`}><span className="flex items-center gap-1.5"><Download className="w-3.5 h-3.5"/>EXPORT</span></button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </>
-  );
-}
-
-function SettingsRoom({ state, scenario }: { state: FrameState; scenario: ScenarioFull }) {
-  return (
-    <>
-      <KpiRow state={state}/>
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-        <div className="corners relative glass rounded-sm p-4">
-          <div className="cbr"></div>
-          <div className="flex items-center gap-2 mb-3"><Settings className="w-4 h-4 text-amber-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">SENSOR SOURCES</h3></div>
-          {['NetFlow · pcap ingest', 'Zeek logs (bro)', 'Windows event forwarders', 'AWS VPC flow logs', 'K8s audit stream'].map((s, i) => (
-            <div key={i} className="flex items-center justify-between py-2 border-b border-white/5 last:border-b-0">
-              <span className="text-[12.5px] text-white/85">{s}</span>
-              <span className="chip"><CircleDot className="w-2 h-2 text-lime-300 blink"/>ACTIVE</span>
-            </div>
-          ))}
-        </div>
-        <div className="corners relative glass rounded-sm p-4">
-          <div className="cbr"></div>
-          <div className="flex items-center gap-2 mb-3"><BrainCircuit className="w-4 h-4 text-cyan-300"/><h3 className="font-display text-[13px] tracking-wider text-white/90">MODEL & SCENARIO</h3></div>
-          {[
-            { k: 'Model checkpoint',   v: 'tw-v3.4.1' },
-            { k: 'Feature schema',     v: 'phase03-v1-sealed · 80 features' },
-            { k: 'Temporal window',    v: '5 frames EWMA' },
-            { k: 'Threshold',          v: '0.45' },
-            { k: 'Explanation method', v: 'SHAP contribution' },
-            { k: 'Scenario id',        v: scenario.id },
-            { k: 'Scenario seed',      v: '42' },
-            { k: 'Total frames',       v: String(state.frame_count) },
-          ].map((r) => (
-            <div key={r.k} className="flex items-center justify-between py-2 border-b border-white/5 last:border-b-0">
-              <span className="text-[12.5px] text-white/70">{r.k}</span>
-              <span className="font-mono text-[11px] text-cyan-300">{r.v}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </>
-  );
-}
+function SimulateRoom_LEGACY_UNUSED() { return null; }
+function ReportsRoom_LEGACY_UNUSED() { return null; }
+function SettingsRoom_LEGACY_UNUSED() { return null; }
 
 /* =========================================================================
    TOAST
@@ -998,15 +1302,15 @@ function App() {
   const [scenario, setScenario] = useState<ScenarioFull | null>(null);
   const [frameState, setFrameState] = useState<FrameState | null>(null);
   const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [care, setCare] = useState<CareSettings | null>(null);
 
-  const [frame, setFrame] = useState(12);
+  const [frame, setFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [activeMitigations, setActiveMitigations] = useState<Record<string, boolean>>({});
   const [sim, setSim] = useState<SimResult | null>(null);
 
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ msg: string; tone: 'ok' | 'err' } | null>(null);
 
   const flash = useCallback((msg: string, tone: 'ok' | 'err' = 'ok') => {
@@ -1018,8 +1322,8 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [sc, tn] = await Promise.all([api.listScenarios(), api.listTenants()]);
-        setScenarios(sc); setTenants(tn);
+        const [sc, tn, cs] = await Promise.all([api.listScenarios(), api.listTenants(), api.getCareSettings()]);
+        setScenarios(sc); setTenants(tn); setCare(cs);
         if (sc.length > 0) setScenarioId(sc.find(s => s.id === 'sc-ransom-ω-7742')?.id || sc[0].id);
         if (tn.length > 0) setTenantId(tn[0].id);
       } catch (e) {
@@ -1040,7 +1344,7 @@ function App() {
         // reset mitigations for new scenario, default pick highest-impact
         const top = [...full.mitigations].sort((a,b) => a.delta - b.delta)[0];
         setActiveMitigations(top ? { [top.id]: true } : {});
-        setFrame(Math.min(12, full.frame_count - 1));
+        setFrame(0); // start from Baseline; user presses Play (no auto-play per plan)
       } catch (e) {
         flash(`Failed to load scenario: ${(e as Error).message}`, 'err');
       }
@@ -1076,46 +1380,20 @@ function App() {
     return () => { alive = false; };
   }, [scenarioId, frame, activeMitigations]);
 
-  // incidents refresh
   const refreshIncidents = useCallback(async () => {
-    if (!tenantId) return;
     try {
-      const list = await api.listIncidents(tenantId);
+      // fetch all — auto reports are tenant-less by design
+      const list = await api.listIncidents();
       setIncidents(list);
     } catch (_) { /* silent */ }
-  }, [tenantId]);
-  useEffect(() => { refreshIncidents(); }, [refreshIncidents]);
+  }, []);
+  useEffect(() => { refreshIncidents(); }, [refreshIncidents, frameState?.incident.lifecycle.stage]);
 
   // auto-stop scrubber
   useEffect(() => {
     if (!frameState) return;
     if (frame >= frameState.frame_count - 1 && playing) setPlaying(false);
   }, [frame, playing, frameState]);
-
-  const saveIncident = useCallback(async () => {
-    if (!scenario || !frameState) return;
-    setSaving(true);
-    try {
-      const tenant = tenants.find(t => t.id === tenantId);
-      const activeIds = Object.keys(activeMitigations).filter(k => activeMitigations[k]);
-      const inc = await api.createIncident({
-        scenario_id: scenario.id,
-        tenant_id: tenantId,
-        frame: frameState.frame,
-        title: `${scenario.name} — F${String(frameState.frame).padStart(2, '0')} snapshot`,
-        operator: tenant?.operator,
-        notes: `Auto-captured at ${new Date().toISOString()}`,
-        mitigation_ids: activeIds,
-      });
-      flash(`Incident ${inc.id} saved`);
-      await refreshIncidents();
-      setNav('reports');
-    } catch (e) {
-      flash(`Save failed: ${(e as Error).message}`, 'err');
-    } finally {
-      setSaving(false);
-    }
-  }, [scenario, frameState, tenantId, tenants, activeMitigations, flash, refreshIncidents]);
 
   const exportIncident = useCallback((id: string) => {
     const inc = incidents.find(i => i.id === id);
@@ -1131,10 +1409,27 @@ function App() {
   const jumpToIncident = useCallback((inc: Incident) => {
     if (inc.scenario_id !== scenarioId) setScenarioId(inc.scenario_id);
     setFrame(inc.frame);
-    setActiveMitigations(Object.fromEntries(inc.mitigation_ids.map(id => [id, true])));
+    if (inc.mitigation_ids && inc.mitigation_ids.length) {
+      setActiveMitigations(Object.fromEntries(inc.mitigation_ids.map(id => [id, true])));
+    }
     setNav('overview');
     flash(`Loaded ${inc.id}`);
   }, [scenarioId, flash]);
+
+  const patchCare = useCallback(async (patch: Partial<CareSettings>) => {
+    try {
+      const updated = await api.putCareSettings(patch);
+      setCare(updated);
+      // trigger frame refetch to reflect new thresholds
+      if (scenarioId) {
+        const st = await api.getFrame(scenarioId, frame);
+        setFrameState(st);
+      }
+      await refreshIncidents();
+    } catch (e) {
+      flash(`CARE update failed: ${(e as Error).message}`, 'err');
+    }
+  }, [scenarioId, frame, refreshIncidents, flash]);
 
   if (loading) {
     return (
@@ -1166,7 +1461,7 @@ function App() {
         conf={frameState.kpis.forecast_confidence}
         scenarios={scenarios} scenarioId={scenarioId} onScenario={setScenarioId}
         tenants={tenants} tenantId={tenantId} onTenant={setTenantId}
-        onSave={saveIncident} saving={saving}
+        lifecycleStage={frameState.incident.lifecycle.stage}
       />
       <div className="flex">
         <NavRail current={nav} setCurrent={setNav} tenant={currentTenant} operator={currentTenant?.operator}/>
@@ -1181,17 +1476,18 @@ function App() {
             {nav === 'xai'      && <XaiRoom      state={frameState}/>}
             {nav === 'mitre'    && <MitreRoom    state={frameState}/>}
             {nav === 'simulate' && <SimulateRoom state={frameState} scenario={scenario} hovered={hovered} setHovered={setHovered} activeMitigations={activeMitigations} setActiveMitigations={setActiveMitigations} sim={sim}/>}
-            {nav === 'reports'  && <ReportsRoom  state={frameState} incidents={incidents} onExport={exportIncident} onJumpTo={jumpToIncident}/>}
-            {nav === 'settings' && <SettingsRoom state={frameState} scenario={scenario}/>}
+            {nav === 'reports'  && <ReportsRoom  state={frameState} incidents={incidents} onExport={exportIncident} onJumpTo={jumpToIncident} onRefresh={refreshIncidents}/>}
+            {nav === 'settings' && <SettingsRoom state={frameState} scenario={scenario} care={care} onCarePatch={patchCare}/>}
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 pt-4 mt-8 border-t border-white/5 text-[11px] text-white/40 font-mono" data-testid="footer-strip">
-            <div>CyberWorld AI · Predictive Intelligence Layer · Twin v3.4.1</div>
+            <div>CyberWorld AI · Autonomous Cyber-Containment Prototype · Twin v3.4.1</div>
             <div className="flex items-center gap-3">
-              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-lime-300"/>Predict</span>
-              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-violet-300"/>Explain</span>
-              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-amber-300"/>Simulate</span>
-              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-cyan-300"/>Defend</span>
+              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-rose-300"/>Detect</span>
+              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-amber-300"/>Contain</span>
+              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-cyan-300"/>Analyze</span>
+              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-violet-300"/>Verify</span>
+              <span className="flex items-center gap-1.5"><CircleDot className="w-2 h-2 text-lime-300"/>Report</span>
             </div>
             <div>API: /api · scenario {scenario.id} · seed 42</div>
           </div>

@@ -433,6 +433,272 @@ def compute_frame(scenario: dict, frame: int) -> dict[str, Any]:
     }
 
 
+async def compute_incident_state(scenario: dict, frame: int) -> dict[str, Any]:
+    """Layered on top of compute_frame: adds lifecycle, primary suspect, spread analysis."""
+    settings = await get_care_settings()
+    df = detection_frame_for(scenario, float(settings["detection_threshold"]))
+    lifecycle = lifecycle_at(frame, df, settings, scenario)
+    primary = None
+    affected: list[dict] = []
+    if lifecycle["stage"] != "Baseline":
+        # pick primary at detection frame so it stays stable through the cycle
+        primary = primary_suspect(scenario, min(frame, df))
+        if lifecycle["stage"] not in ("Detecting", "Threat Detected"):
+            affected = spread_analysis(scenario, primary, frame, settings)
+    counts = {"ISOLATE": 0, "RESTRICT": 0, "MONITOR": 0, "PROTECT": 0, "NO_ACTION": 0}
+    for h in affected:
+        counts[h["action"]] = counts.get(h["action"], 0) + 1
+    return {
+        "lifecycle": lifecycle,
+        "primary_suspect": ({
+            "id": primary["id"], "label": primary["label"], "tier": primary.get("tier"),
+            "kind": primary.get("kind"), "ip": primary.get("ip"),
+            "risk": risk_at(primary, frame),
+            "confidence": threat_confidence(primary, scenario, frame),
+        } if primary else None),
+        "affected_systems": affected,
+        "affected_counts": counts,
+        "care_settings": settings,
+    }
+
+
+# --------------------------------------------------------------------------
+# CARE — CyberWorld Autonomous Response Engine
+# --------------------------------------------------------------------------
+CRITICAL_TIERS = {"Crown Jewels", "Core Identity"}
+RISK_SCORE = {"safe": 0.10, "watch": 0.35, "warn": 0.65, "critical": 0.90}
+
+DEFAULT_CARE_SETTINGS: dict[str, Any] = {
+    "detection_threshold": 0.55,
+    "isolate_threshold": 0.90,
+    "restrict_threshold": 0.75,
+    "monitor_threshold": 0.50,
+    "max_response_cycles": 3,
+    "verification_window_frames": 4,
+    "protect_critical_assets": True,
+}
+
+
+async def get_care_settings() -> dict[str, Any]:
+    doc = await db.care_settings.find_one({"id": "global"}, {"_id": 0})
+    if not doc:
+        return dict(DEFAULT_CARE_SETTINGS)
+    return {**DEFAULT_CARE_SETTINGS, **doc}
+
+
+def detection_frame_for(scenario: dict, detection_threshold: float) -> int:
+    """First frame where the incident-response trigger fires.
+
+    Uses the existing early-warning condition: the first frame where any host
+    escalates to `warn` or higher, deterministic across the scenario data.
+    `detection_threshold` is retained as a policy dial that tightens or loosens
+    the trigger via a lookahead offset (higher threshold -> later trigger).
+    """
+    total = int(scenario.get("frame_count", 30))
+    warn_frame = total
+    for f in range(total):
+        for n in scenario["nodes"]:
+            r = risk_at(n, f)
+            if r in ("warn", "critical"):
+                warn_frame = f
+                break
+        if warn_frame < total:
+            break
+    # threshold acts as a small offset — 0.5 = trigger at first warn, 1.0 = wait longer
+    offset = max(0, int((detection_threshold - 0.5) * 8))
+    return min(total - 1, warn_frame + offset)
+
+
+def primary_suspect(scenario: dict, frame: int) -> dict | None:
+    """Highest-risk host at the given frame; deterministic tie-break by earliest escalate_at then id."""
+    scored: list[tuple[int, int, str, dict]] = []
+    for n in scenario["nodes"]:
+        r = risk_at(n, frame)
+        rank = ["safe", "watch", "warn", "critical"].index(r)
+        scored.append((-rank, int(n.get("escalate_at", 9999)), n["id"], n))
+    scored.sort()
+    return scored[0][3] if scored else None
+
+
+def _graph_novelty(node_id: str, edges: list[dict], frame: int) -> float:
+    """0..1 score: presence on malicious/predicted/recently-appeared edges."""
+    score = 0.0
+    for e in edges:
+        if node_id not in (e.get("from"), e.get("to")):
+            continue
+        appears = int(e.get("appears_at", -1))
+        if appears > frame:
+            continue
+        if e.get("malicious"):
+            score = max(score, 0.9)
+        elif e.get("predicted"):
+            score = max(score, 0.7)
+        elif appears >= max(0, frame - 4):
+            score = max(score, 0.55)
+        else:
+            score = max(score, 0.25)
+    return score
+
+
+def _target_score(node: dict, scenario: dict, frame: int) -> float:
+    """0..1: peak target probability if this host matches a predicted target."""
+    for t in scenario["target_pool"]:
+        host = str(t["host"])
+        if host.startswith(node["id"]) or node["id"] in host or node["label"] in host:
+            return stage_prob(int(t["activate_at"]), float(t["peak"]), frame)
+        first_token = node["label"].split()[0].lower() if node.get("label") else ""
+        if first_token and first_token in host.lower():
+            return stage_prob(int(t["activate_at"]), float(t["peak"]), frame)
+    return 0.0
+
+
+def threat_confidence(node: dict, scenario: dict, frame: int) -> float:
+    """Policy-derived combination — not a separately trained ML probability."""
+    r = risk_at(node, frame)
+    r_s = RISK_SCORE.get(r, 0.1)
+    g_s = _graph_novelty(node["id"], scenario["edges"], frame)
+    t_s = _target_score(node, scenario, frame)
+    conf = 0.55 * r_s + 0.30 * g_s + 0.15 * t_s
+    return round(max(0.0, min(1.0, conf)), 3)
+
+
+def care_decision(node: dict, conf: float, settings: dict[str, Any]) -> tuple[str, str]:
+    """Return (action, reason). Actions: ISOLATE, RESTRICT, MONITOR, PROTECT, NO_ACTION."""
+    critical = node.get("tier") in CRITICAL_TIERS
+    iso = float(settings["isolate_threshold"])
+    res = float(settings["restrict_threshold"])
+    mon = float(settings["monitor_threshold"])
+    if critical and settings.get("protect_critical_assets", True):
+        if conf >= iso:
+            return "PROTECT", "Critical asset with very high threat confidence — suspicious paths restricted, monitoring heightened, asset preserved for engineer recovery."
+        if conf >= res:
+            return "PROTECT", "Critical asset with elevated threat confidence — protective containment, no blind isolation."
+        if conf >= mon:
+            return "MONITOR", "Critical asset under baseline suspicion — heightened observation."
+        return "NO_ACTION", "Critical asset with confidence below action threshold — observe only."
+    if conf >= iso:
+        return "ISOLATE", "High policy-derived threat confidence — auto-isolate in replay/lab environment."
+    if conf >= res:
+        return "RESTRICT", "Elevated threat confidence — restrict suspicious edges, heightened monitoring."
+    if conf >= mon:
+        return "MONITOR", "Suspicion above monitor threshold — no traffic changes, elevated observation."
+    return "NO_ACTION", "Threat confidence below action thresholds — observe only."
+
+
+def spread_analysis(scenario: dict, primary: dict, frame: int, settings: dict[str, Any]) -> list[dict]:
+    """Evaluate every host as potentially affected; return CARE decision + rationale."""
+    out: list[dict] = []
+    if not primary:
+        return out
+    pid = primary["id"]
+    # direct neighbours via any edge appearing on/before frame
+    neighbours: set[str] = set()
+    for e in scenario["edges"]:
+        if int(e.get("appears_at", -1)) > frame:
+            continue
+        if e["from"] == pid:
+            neighbours.add(e["to"])
+        elif e["to"] == pid:
+            neighbours.add(e["from"])
+    for n in scenario["nodes"]:
+        if n["id"] == pid:
+            continue
+        conf = threat_confidence(n, scenario, frame)
+        # graph-adjacency bonus
+        if n["id"] in neighbours:
+            conf = round(min(1.0, conf + 0.08), 3)
+        action, reason = care_decision(n, conf, settings)
+        out.append({
+            "id": n["id"],
+            "label": n["label"],
+            "tier": n.get("tier", "Unknown"),
+            "kind": n.get("kind", "server"),
+            "risk": risk_at(n, frame),
+            "confidence": conf,
+            "action": action,
+            "reason": reason,
+            "critical": n.get("tier") in CRITICAL_TIERS,
+            "neighbour_of_primary": n["id"] in neighbours,
+        })
+    # highest confidence first, but keep critical assets grouped visibly by pushing them up on ties
+    out.sort(key=lambda h: (-h["confidence"], not h["critical"], h["id"]))
+    return out
+
+
+def lifecycle_at(frame: int, detection_frame: int, settings: dict[str, Any], scenario: dict) -> dict:
+    """Compute the current incident-response lifecycle stage and derived flags.
+
+    Timeline after detection (frame indices relative to detection_frame):
+      +0  Threat Detected
+      +1  Initial Containment
+      +2  Spread Analysis
+      +3  Host Assessment
+      +4  Secondary Containment
+      +5..+(4+verif)  Verifying
+      +5+verif        Contained (propagation stopped)
+      +7+verif        Report Ready
+      +9+verif        Engineer Handoff
+    Cycle can re-run once per verification failure, bounded by max_response_cycles.
+    All seeded scenarios contain successfully on cycle 1 by design.
+    """
+    verif = int(settings["verification_window_frames"])
+    max_cycles = int(settings["max_response_cycles"])
+    verify_start = detection_frame + 4
+    verify_end = verify_start + verif
+
+    stage = "Baseline"
+    cycle = 1
+    verifying_progress = 0.0
+    propagation_stopped = False
+    escalation_required = False
+
+    if frame < detection_frame:
+        # Detecting window (3 frames of rising risk before automation trigger)
+        stage = "Detecting" if frame >= max(0, detection_frame - 3) else "Baseline"
+    elif frame == detection_frame:
+        stage = "Threat Detected"
+    elif frame == detection_frame + 1:
+        stage = "Initial Containment"
+    elif frame == detection_frame + 2:
+        stage = "Spread Analysis"
+    elif frame == detection_frame + 3:
+        stage = "Host Assessment"
+    elif frame == detection_frame + 4:
+        stage = "Secondary Containment"
+    elif frame < verify_end:
+        stage = "Verifying"
+        verifying_progress = min(1.0, (frame - verify_start) / max(1, verif))
+    elif frame == verify_end:
+        stage = "Contained"
+        propagation_stopped = True
+    elif frame < verify_end + 3:
+        stage = "Contained"
+        propagation_stopped = True
+    elif frame < verify_end + 5:
+        stage = "Report Ready"
+        propagation_stopped = True
+    else:
+        stage = "Engineer Handoff"
+        propagation_stopped = True
+
+    if cycle > max_cycles:
+        escalation_required = True
+        propagation_stopped = False
+        stage = "Engineer Handoff"
+
+    return {
+        "stage": stage,
+        "cycle": cycle,
+        "max_cycles": max_cycles,
+        "detection_frame": detection_frame,
+        "verify_start_frame": verify_start,
+        "verify_end_frame": verify_end,
+        "verifying_progress": round(verifying_progress, 3),
+        "propagation_stopped": propagation_stopped,
+        "escalation_required": escalation_required,
+    }
+
+
 def compute_baseline_and_mitigated(scenario: dict, frame: int, mitigation_ids: list[str]) -> dict:
     baseline = 0.0
     for t in scenario["target_pool"]:
@@ -542,7 +808,130 @@ async def get_frame(scenario_id: str, frame: int) -> dict[str, Any]:
     sc = await db.scenarios.find_one({"id": scenario_id}, {"_id": 0})
     if not sc:
         raise HTTPException(status_code=404, detail="scenario not found")
-    return compute_frame(sc, frame)
+    base = compute_frame(sc, frame)
+    incident = await compute_incident_state(sc, frame)
+    # augment log stream with lifecycle-driven event lines
+    life = incident["lifecycle"]
+    df = life["detection_frame"]
+    life_events: list[dict] = []
+    if frame >= df - 2:
+        life_events.append({"at": max(0, df - 2), "tag": "DETECT", "color": "amber", "text": "Temporal risk rising — CARE monitoring elevated"})
+    if frame >= df:
+        prim = (incident.get("primary_suspect") or {}).get("label", "primary host")
+        life_events.append({"at": df, "tag": "DETECT", "color": "rose", "text": f"Threat detected on {prim} — automated containment initiated"})
+        life_events.append({"at": df + 1, "tag": "CARE", "color": "lime", "text": f"Initial containment — {prim} isolated in replay environment"})
+    if frame >= df + 2:
+        life_events.append({"at": df + 2, "tag": "CARE", "color": "cyan", "text": "Spread analysis running across digital twin neighbours"})
+    if frame >= df + 3:
+        counts = incident["affected_counts"]
+        life_events.append({"at": df + 3, "tag": "CARE", "color": "cyan", "text": f"Host assessment complete — ISOLATE {counts['ISOLATE']} · RESTRICT {counts['RESTRICT']} · MONITOR {counts['MONITOR']} · PROTECT {counts['PROTECT']}"})
+    if frame >= df + 4:
+        life_events.append({"at": df + 4, "tag": "CARE", "color": "lime", "text": "Secondary containment applied to potentially affected systems"})
+    if frame >= life["verify_start_frame"] + 1:
+        life_events.append({"at": life["verify_start_frame"] + 1, "tag": "VERIFY", "color": "violet", "text": "Verification window monitoring for further propagation"})
+    if life["propagation_stopped"] and frame >= life["verify_end_frame"]:
+        life_events.append({"at": life["verify_end_frame"], "tag": "VERIFY", "color": "lime", "text": "Containment successful — no further suspicious propagation observed"})
+    if life["stage"] == "Report Ready":
+        life_events.append({"at": life["verify_end_frame"] + 2, "tag": "REPORT", "color": "cyan", "text": "Incident report auto-assembled and persisted for engineer review"})
+    if life["stage"] == "Engineer Handoff":
+        life_events.append({"at": life["verify_end_frame"] + 4, "tag": "HANDOFF", "color": "amber", "text": "Engineer handoff — investigate · remediate · recover"})
+    # merge, dedupe by (at, text), sort by at
+    combined = list(base["logs"])
+    seen = {(l["at"], l["text"]) for l in combined}
+    for l in life_events:
+        if (l["at"], l["text"]) not in seen and l["at"] <= frame:
+            combined.append({"t": f"{l['at'] * 0.12:.3f}", **l})
+            seen.add((l["at"], l["text"]))
+    combined.sort(key=lambda x: x["at"])
+    base["logs"] = combined
+    base["incident"] = incident
+
+    # Auto-persist incident report when Report Ready is reached (idempotent per scenario)
+    if life["stage"] in ("Report Ready", "Engineer Handoff"):
+        existing = await db.incidents.find_one({"scenario_id": scenario_id, "auto": True}, {"_id": 0})
+        if not existing:
+            await _persist_auto_report(sc, base, incident)
+    return base
+
+
+async def _persist_auto_report(sc: dict, frame_state: dict, incident: dict) -> dict[str, Any]:
+    life = incident["lifecycle"]
+    df = life["detection_frame"]
+    end_frame = life["verify_end_frame"]
+    frame_at_end = compute_frame(sc, end_frame)
+    detection_state = compute_frame(sc, df)
+    baseline_end = max([stage_prob(int(t["activate_at"]), float(t["peak"]), end_frame) for t in sc["target_pool"]] + [0.0])
+    baseline_start = max([stage_prob(int(t["activate_at"]), float(t["peak"]), df) for t in sc["target_pool"]] + [0.0])
+    incident_id = f"inc-auto-{sc['id']}"[:64]
+    doc = {
+        "id": incident_id,
+        "scenario_id": sc["id"],
+        "scenario_name": sc["name"],
+        "auto": True,
+        "tenant_id": None,
+        "frame": end_frame,
+        "detection_frame": df,
+        "title": f"{sc['name']} — Autonomous containment report",
+        "operator": "CARE (autonomous)",
+        "notes": "Auto-generated after verification loop completed successfully.",
+        "created_at": now_iso(),
+        "primary_suspect": incident.get("primary_suspect"),
+        "affected_systems": incident.get("affected_systems"),
+        "affected_counts": incident.get("affected_counts"),
+        "care_settings": incident.get("care_settings"),
+        "lifecycle": life,
+        "engineer_action_required": "Investigate isolated systems, perform root-cause analysis on the primary suspect, review credentials, patch and remediate impacted hosts, recover from clean backups. Simulated lab actions — no real endpoints were disconnected.",
+        "snapshot": {
+            "kpis_at_detection": detection_state["kpis"],
+            "kpis_at_end": frame_at_end["kpis"],
+            "stages_at_end": frame_at_end["stages"],
+            "targets_at_end": frame_at_end["targets"],
+            "mitre_active": [
+                {"tactic": col["tactic"], "id": t["id"], "name": t["name"], "conf": t["current_conf"]}
+                for col in frame_at_end["mitre"] for t in col["techniques"] if t["active"]
+            ],
+            "xai_active": [s for s in frame_at_end["xai"] if s["active"]],
+            "response_metrics": {
+                "detection_frame": df,
+                "initial_containment_frame": df + 1,
+                "secondary_containment_frame": df + 4,
+                "verification_start_frame": life["verify_start_frame"],
+                "verification_end_frame": end_frame,
+                "cycles_used": life["cycle"],
+                "propagation_stopped": life["propagation_stopped"],
+                "peak_risk_at_detection": round(baseline_start, 4),
+                "peak_risk_at_end": round(baseline_end, 4),
+                "risk_reduction_pct": round((baseline_start - baseline_end) * 100, 2),
+            },
+        },
+    }
+    await db.incidents.update_one({"id": incident_id}, {"$set": doc}, upsert=True)
+    return doc
+
+
+class CareSettingsReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    detection_threshold: float | None = Field(None, ge=0.0, le=1.0)
+    isolate_threshold: float | None = Field(None, ge=0.0, le=1.0)
+    restrict_threshold: float | None = Field(None, ge=0.0, le=1.0)
+    monitor_threshold: float | None = Field(None, ge=0.0, le=1.0)
+    max_response_cycles: int | None = Field(None, ge=1, le=10)
+    verification_window_frames: int | None = Field(None, ge=1, le=15)
+    protect_critical_assets: bool | None = None
+
+
+@app.get("/api/care/settings")
+async def care_settings_get() -> dict[str, Any]:
+    return await get_care_settings()
+
+
+@app.put("/api/care/settings")
+async def care_settings_put(req: CareSettingsReq) -> dict[str, Any]:
+    current = await get_care_settings()
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    merged = {**current, **updates, "id": "global"}
+    await db.care_settings.update_one({"id": "global"}, {"$set": merged}, upsert=True)
+    return {k: v for k, v in merged.items() if k != "id"}
 
 
 @app.post("/api/simulate")
