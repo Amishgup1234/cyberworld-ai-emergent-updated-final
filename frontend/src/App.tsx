@@ -6,10 +6,10 @@ import {
   Router as RouterIcon, HardDrive, Cloud, User, Fingerprint as FingerprintIcon, Waves,
   ChevronsRight, ShieldOff, CircleDot, Target, FileText, Settings, Play, Pause, RotateCcw,
   Rewind, FastForward, Binary, ChevronLeft, Download, ShieldCheck, BarChart3, Building2,
-  Loader2, Check, Crosshair, UserCheck, RefreshCw,
+  Loader2, Check, Crosshair, UserCheck, RefreshCw, Bug, MapPin, ExternalLink, Plus, Trash2, BookOpen, Wifi, WifiOff, FileDown,
 } from 'lucide-react';
 import { api } from './api/client';
-import type { AffectedSystem, CareAction, CareSettings, FrameStateWithIncident as FrameState, Incident, Mitigation, ScenarioFull, ScenarioMeta, SimResult, Tenant } from './api/client';
+import type { AffectedSystem, CareAction, CareSettings, FrameStateWithIncident as FrameState, Incident, Mitigation, NodeIntel, Playbook, ScenarioFull, ScenarioMeta, SimResult, Tenant } from './api/client';
 
 /* =========================================================================
    Helpers
@@ -55,6 +55,44 @@ function useClock() {
   const [now, setNow] = useState<Date>(new Date());
   useEffect(() => { const id = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(id); }, []);
   return now;
+}
+
+/* ---- WebSocket stream: pushes frame states so the whole room reacts in one shot ---- */
+type WsStatus = 'off' | 'connecting' | 'open' | 'error';
+function useFrameStream(scenarioId: string | null, frame: number, enabled: boolean, onFrame: (s: FrameState) => void) {
+  const [status, setStatus] = useState<WsStatus>('off');
+  const wsRef = useRef<WebSocket | null>(null);
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+
+  useEffect(() => {
+    if (!enabled) { if (wsRef.current) { wsRef.current.close(); wsRef.current = null; } setStatus('off'); return; }
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${window.location.host}/api/ws/frames`;
+    setStatus('connecting');
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
+    ws.onopen = () => setStatus('open');
+    ws.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data && !data.error) onFrame(data as FrameState);
+      } catch {}
+    };
+    ws.onerror = () => setStatus('error');
+    ws.onclose = () => { if (enabledRef.current) setStatus('error'); else setStatus('off'); };
+    return () => { ws.close(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled]);
+
+  useEffect(() => {
+    if (!enabled || !scenarioId) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ scenario_id: scenarioId, frame }));
+  }, [scenarioId, frame, enabled]);
+
+  return status;
 }
 
 function fmtLead(sec: number) {
@@ -490,7 +528,7 @@ function EngineerHandoff({ state }: { state: FrameState }) {
    TWIN CANVAS
    ========================================================================= */
 
-function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: FrameState; hovered: string | null; setHovered: (id: string | null) => void; compact?: boolean; }) {
+function TwinCanvas({ state, hovered, setHovered, compact = false, scenarioId }: { state: FrameState; hovered: string | null; setHovered: (id: string | null) => void; compact?: boolean; scenarioId?: string | null }) {
   const nodeById = useMemo(() => Object.fromEntries(state.nodes.map(n => [n.id, n])), [state.nodes]);
   const primaryId = state.incident.primary_suspect?.id || null;
   const actionByHost = useMemo(() => {
@@ -500,6 +538,17 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
   }, [state.incident.affected_systems]);
   const lifecycleStage = state.incident.lifecycle.stage;
   const containmentActive = !['Baseline','Detecting','Threat Detected'].includes(lifecycleStage);
+
+  // Intel cache — fetch on hover, keep per node
+  const [intelCache, setIntelCache] = useState<Record<string, NodeIntel | 'loading'>>({});
+  useEffect(() => {
+    if (!hovered || !scenarioId) return;
+    const key = `${scenarioId}::${hovered}`;
+    if (intelCache[key]) return;
+    setIntelCache(c => ({ ...c, [key]: 'loading' }));
+    api.getIntel(scenarioId, hovered).then(intel => setIntelCache(c => ({ ...c, [key]: intel }))).catch(() => setIntelCache(c => ({ ...c, [key]: 'loading' })));
+  }, [hovered, scenarioId, intelCache]);
+  const hoveredIntel = hovered && scenarioId ? intelCache[`${scenarioId}::${hovered}`] : undefined;
   return (
     <div className="corners relative glass rounded-sm overflow-hidden" data-testid="twin-canvas">
       <div className="cbr"></div>
@@ -585,12 +634,13 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
           })}
         </svg>
         {hovered && nodeById[hovered] && (
-          <div className="absolute top-3 left-3 glass rounded-sm p-3 w-[260px]" data-testid="twin-hover-inspector">
+          <div className="absolute top-3 left-3 glass rounded-sm p-3 w-[320px] max-h-[560px] overflow-y-auto" data-testid="twin-hover-inspector">
             {(() => {
               const n = nodeById[hovered];
               const Icon = KIND_ICON[n.kind] || Server;
               const r = n.risk as Risk;
               const action = actionByHost[n.id];
+              const intel = hoveredIntel && hoveredIntel !== 'loading' ? hoveredIntel : null;
               return (
                 <>
                   <div className="flex items-center justify-between">
@@ -601,6 +651,49 @@ function TwinCanvas({ state, hovered, setHovered, compact = false }: { state: Fr
                     <div>ID   {n.id}</div><div>IP   {n.ip}</div><div>TIER {n.tier}</div><div>KIND {n.kind}</div>
                     {action && <div>CARE <span style={{ color: ACTION_COLOR[action] }}>{action}</span></div>}
                     {n.id === primaryId && containmentActive && <div className="text-rose-300">PRIMARY SUSPECT</div>}
+                  </div>
+                  <div className="mt-3 pt-2 border-t border-white/5">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="font-mono text-[9px] tracking-[0.24em] text-cyan-300/70 uppercase">Threat Intel</span>
+                      {hoveredIntel === 'loading' && <Loader2 className="w-3 h-3 text-cyan-300/60 animate-spin"/>}
+                    </div>
+                    {intel && intel.cves.length === 0 && intel.asns.length === 0 && intel.iocs.length === 0 && (
+                      <div className="font-mono text-[10px] text-white/40">No enrichment records for this host.</div>
+                    )}
+                    {intel?.cves.map(c => (
+                      <div key={c.id} className="mb-1.5" data-testid={`intel-cve-${c.id}`}>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <Bug className="w-3 h-3 text-rose-300 shrink-0"/>
+                            <span className="font-mono text-[10.5px] text-white/90 truncate">{c.id}</span>
+                            {c.kev && <span className="chip !py-0" style={{ color: '#FF2E63', borderColor: 'rgba(255,46,99,0.4)' }}>KEV</span>}
+                          </div>
+                          <span className="font-mono text-[10px] font-bold" style={{ color: c.cvss >= 9 ? '#FF2E63' : c.cvss >= 7 ? '#FFAA00' : '#00F0FF' }}>{c.cvss.toFixed(1)}</span>
+                        </div>
+                        <div className="text-[10.5px] text-white/70 leading-tight">{c.title}</div>
+                        <div className="font-mono text-[9px] text-white/35">{c.severity} · {c.source} · {c.published}</div>
+                      </div>
+                    ))}
+                    {intel?.asns.map(a => (
+                      <div key={a.asn} className="mb-1.5" data-testid={`intel-asn-${a.asn}`}>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5 min-w-0"><MapPin className="w-3 h-3 text-violet-300 shrink-0"/><span className="font-mono text-[10.5px] text-white/90 truncate">{a.asn} · {a.country}</span></div>
+                          <span className="font-mono text-[10px] font-bold" style={{ color: a.score >= 60 ? '#FF2E63' : a.score >= 30 ? '#FFAA00' : '#7CFFB0' }}>rep {a.score}</span>
+                        </div>
+                        <div className="text-[10.5px] text-white/70 leading-tight">{a.name}</div>
+                        <div className="font-mono text-[9px] text-white/35">{a.reputation} · {a.source}</div>
+                      </div>
+                    ))}
+                    {intel?.iocs.map(i => (
+                      <div key={i.value} className="mb-1.5" data-testid={`intel-ioc-${i.type}`}>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5 min-w-0"><ExternalLink className="w-3 h-3 text-amber-300 shrink-0"/><span className="font-mono text-[10.5px] text-white/90 truncate">{i.type} · {i.value}</span></div>
+                          <span className="font-mono text-[10px] font-bold text-amber-300">{(i.confidence * 100).toFixed(0)}%</span>
+                        </div>
+                        <div className="font-mono text-[9px] text-white/35">first-seen {i.first_seen} · {i.source}</div>
+                      </div>
+                    ))}
+                    {intel && <div className="mt-2 font-mono text-[9px] text-white/30">Cached snapshot · {intel.sources.slice(0, 3).join(' · ')}</div>}
                   </div>
                 </>
               );
@@ -961,7 +1054,7 @@ function OverviewRoom({ state, scenario, hovered, setHovered, activeMitigations,
       <KpiRow state={state}/>
       <EngineerHandoff state={state}/>
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
-        <div className="xl:col-span-2 min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered}/></div>
+        <div className="xl:col-span-2 min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered} scenarioId={scenario.id}/></div>
         <div className="min-w-0 flex flex-col gap-5">
           <PrimarySuspectCard state={state}/>
           <ForecastRail state={state}/>
@@ -986,7 +1079,7 @@ function OverviewRoom({ state, scenario, hovered, setHovered, activeMitigations,
   );
 }
 
-function TwinRoom({ state, hovered, setHovered }: { state: FrameState; hovered: string | null; setHovered: (s: string | null) => void }) {
+function TwinRoom({ state, hovered, setHovered, scenario }: { state: FrameState; hovered: string | null; setHovered: (s: string | null) => void; scenario: ScenarioFull }) {
   return (
     <>
       <IncidentBanner state={state}/>
@@ -997,7 +1090,7 @@ function TwinRoom({ state, hovered, setHovered }: { state: FrameState; hovered: 
         <KpiTile icon={ShieldCheck}   label="Twin Fidelity"  value={state.kpis.twin_fidelity.toFixed(1)}    unit="%" tone="lime" trend="drift < 0.02 rmse" testid="kpi-fidelity"/>
       </div>
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 mb-5">
-        <div className="xl:col-span-2 min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered}/></div>
+        <div className="xl:col-span-2 min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered} scenarioId={scenario.id}/></div>
         <div className="min-w-0 flex flex-col gap-5">
           <div className="corners relative glass rounded-sm p-4" data-testid="tier-breakdown">
             <div className="cbr"></div>
@@ -1106,7 +1199,7 @@ function SimulateRoom({ state, scenario, hovered, setHovered, activeMitigations,
       <KpiRow state={state}/>
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-5">
         <SimulationPanel scenario={scenario} frame={state.frame} activeMitigations={activeMitigations} setActiveMitigations={setActiveMitigations} sim={sim}/>
-        <div className="min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered} compact/></div>
+        <div className="min-w-0"><TwinCanvas state={state} hovered={hovered} setHovered={setHovered} scenarioId={scenario.id} compact/></div>
       </div>
       <LiveTerminal state={state}/>
     </>
@@ -1309,6 +1402,9 @@ function App() {
   const [speed, setSpeed] = useState(1);
   const [activeMitigations, setActiveMitigations] = useState<Record<string, boolean>>({});
   const [sim, setSim] = useState<SimResult | null>(null);
+  const [streaming, setStreaming] = useState(true);
+  const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
+  const wsStatus = useFrameStream(scenarioId, frame, streaming, (st) => setFrameState(st));
 
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<{ msg: string; tone: 'ok' | 'err' } | null>(null);
@@ -1471,7 +1567,7 @@ function App() {
 
           <div key={nav} className="rise-in">
             {nav === 'overview' && <OverviewRoom state={frameState} scenario={scenario} hovered={hovered} setHovered={setHovered} activeMitigations={activeMitigations} setActiveMitigations={setActiveMitigations} sim={sim}/>}
-            {nav === 'twin'     && <TwinRoom     state={frameState} hovered={hovered} setHovered={setHovered}/>}
+            {nav === 'twin'     && <TwinRoom     state={frameState} hovered={hovered} setHovered={setHovered} scenario={scenario}/>}
             {nav === 'forecast' && <ForecastRoom state={frameState}/>}
             {nav === 'xai'      && <XaiRoom      state={frameState}/>}
             {nav === 'mitre'    && <MitreRoom    state={frameState}/>}

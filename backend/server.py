@@ -10,16 +10,20 @@ FastAPI + MongoDB service that powers the digital twin dashboard:
 """
 from __future__ import annotations
 
+import io
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+from threat_intel import resolve_intel
 
 # --------------------------------------------------------------------------
 # Environment / Database
@@ -767,6 +771,7 @@ async def seed_and_index() -> None:
     # Indexes
     await db.incidents.create_index("id", unique=True)
     await db.incidents.create_index("created_at")
+    await db.playbooks.create_index("id", unique=True)
 
 
 @app.get("/api/health")
@@ -994,3 +999,236 @@ async def get_incident(incident_id: str) -> dict[str, Any]:
     if not doc:
         raise HTTPException(status_code=404, detail="incident not found")
     return doc
+
+
+# --------------------------------------------------------------------------
+# Threat Intel Enrichment (cached public sources — NVD, CISA KEV, Spamhaus, OTX)
+# --------------------------------------------------------------------------
+
+@app.get("/api/scenarios/{scenario_id}/intel/{node_id}")
+async def node_intel(scenario_id: str, node_id: str) -> dict[str, Any]:
+    sc = await db.scenarios.find_one({"id": scenario_id}, {"_id": 0})
+    if not sc:
+        raise HTTPException(status_code=404, detail="scenario not found")
+    node = next((n for n in sc["nodes"] if n["id"] == node_id), None)
+    if not node:
+        raise HTTPException(status_code=404, detail="node not found")
+    intel = resolve_intel(scenario_id, node)
+    return {"node_id": node_id, "scenario_id": scenario_id, **intel}
+
+
+# --------------------------------------------------------------------------
+# Playbooks — save named CARE threshold sets with auto-match patterns
+# --------------------------------------------------------------------------
+
+class PlaybookReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(..., min_length=2, max_length=64)
+    match: dict[str, Any] = Field(default_factory=dict)   # {"scenario_family": "...", "scenario_id": "..."}
+    thresholds: dict[str, Any] = Field(default_factory=dict)
+    auto_apply: bool = True
+
+
+@app.get("/api/playbooks")
+async def list_playbooks() -> list[dict[str, Any]]:
+    cur = db.playbooks.find({}, {"_id": 0}).sort("created_at", -1)
+    return [p async for p in cur]
+
+
+@app.post("/api/playbooks")
+async def create_playbook(req: PlaybookReq) -> dict[str, Any]:
+    doc = {
+        "id": f"pb-{uuid.uuid4().hex[:8]}",
+        "name": req.name,
+        "match": req.match,
+        "thresholds": req.thresholds,
+        "auto_apply": req.auto_apply,
+        "created_at": now_iso(),
+    }
+    await db.playbooks.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+@app.delete("/api/playbooks/{playbook_id}")
+async def delete_playbook(playbook_id: str) -> dict[str, Any]:
+    r = await db.playbooks.delete_one({"id": playbook_id})
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="playbook not found")
+    return {"deleted": playbook_id}
+
+
+@app.post("/api/playbooks/match")
+async def match_playbook(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return best-matching auto_apply playbook for a scenario, if any."""
+    scenario_id = payload.get("scenario_id")
+    family = payload.get("family")
+    if not scenario_id:
+        return {"match": None}
+    cur = db.playbooks.find({"auto_apply": True}, {"_id": 0})
+    best = None
+    async for pb in cur:
+        m = pb.get("match", {})
+        # exact scenario id wins over family match
+        if m.get("scenario_id") == scenario_id:
+            best = pb
+            break
+        if family and m.get("scenario_family") and family.lower().startswith(m["scenario_family"].lower()):
+            best = pb
+    if best:
+        # apply thresholds
+        current = await get_care_settings()
+        merged = {**current, **best.get("thresholds", {}), "id": "global"}
+        await db.care_settings.update_one({"id": "global"}, {"$set": merged}, upsert=True)
+    return {"match": best}
+
+
+# --------------------------------------------------------------------------
+# Live streaming via WebSocket — replaces frame-fetch HTTP roundtrip when playing
+# --------------------------------------------------------------------------
+
+@app.websocket("/api/ws/frames")
+async def ws_frames(ws: WebSocket) -> None:
+    """Client protocol:
+       -> {"scenario_id": "...", "frame": N}
+       <- <full frame payload same shape as GET /api/scenarios/{id}/frame/{N}>
+    """
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_json()
+            sid = msg.get("scenario_id")
+            frame = int(msg.get("frame", 0))
+            sc = await db.scenarios.find_one({"id": sid}, {"_id": 0})
+            if not sc:
+                await ws.send_json({"error": "scenario not found", "scenario_id": sid})
+                continue
+            base = compute_frame(sc, frame)
+            incident = await compute_incident_state(sc, frame)
+            base["incident"] = incident
+            await ws.send_json(base)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:  # keep the connection resilient — surface once, then close
+        try:
+            await ws.send_json({"error": str(e)})
+        finally:
+            await ws.close()
+
+
+# --------------------------------------------------------------------------
+# PDF Export — one-pager incident report suitable for engineer handoff
+# --------------------------------------------------------------------------
+
+def _render_incident_pdf(doc: dict) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buf = io.BytesIO()
+    pdf = SimpleDocTemplate(buf, pagesize=LETTER, leftMargin=0.55 * inch, rightMargin=0.55 * inch, topMargin=0.5 * inch, bottomMargin=0.5 * inch, title=doc.get("title", "CyberWorld AI Incident Report"))
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("t", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=17, spaceAfter=6, textColor=colors.HexColor("#0B1020"))
+    sub_style = ParagraphStyle("s", parent=styles["Normal"], fontSize=8.5, textColor=colors.HexColor("#4A536B"), spaceAfter=6)
+    h2_style = ParagraphStyle("h2", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=10.5, spaceBefore=8, spaceAfter=4, textColor=colors.HexColor("#0B1020"))
+    body = ParagraphStyle("b", parent=styles["Normal"], fontSize=9, leading=12, textColor=colors.HexColor("#0B1020"))
+    small = ParagraphStyle("sm", parent=styles["Normal"], fontSize=7.5, leading=10, textColor=colors.HexColor("#4A536B"))
+
+    story = []
+    story.append(Paragraph("CyberWorld AI · Autonomous Containment Report", title_style))
+    story.append(Paragraph(f"{doc.get('scenario_name', '')} — Report {doc.get('id', '')} · generated {doc.get('created_at', '')}", sub_style))
+
+    ps = doc.get("primary_suspect") or {}
+    life = doc.get("lifecycle") or {}
+    story.append(Paragraph("Detection", h2_style))
+    story.append(Paragraph(f"<b>Primary suspect:</b> {ps.get('label', 'n/a')} ({ps.get('id', 'n/a')} · {ps.get('tier', '—')})<br/><b>Detection confidence:</b> {(ps.get('confidence', 0) * 100):.0f}% (policy-derived)<br/><b>Detection frame:</b> F{doc.get('detection_frame', '?')}<br/><b>Verify end:</b> F{life.get('verify_end_frame', '?')} · <b>Cycles used:</b> {life.get('cycle', '?')}/{life.get('max_cycles', '?')}", body))
+
+    counts = doc.get("affected_counts") or {}
+    story.append(Paragraph("Automated Response Summary", h2_style))
+    count_row = [["ISOLATE", "RESTRICT", "MONITOR", "PROTECT", "NO_ACTION"], [str(counts.get("ISOLATE", 0)), str(counts.get("RESTRICT", 0)), str(counts.get("MONITOR", 0)), str(counts.get("PROTECT", 0)), str(counts.get("NO_ACTION", 0))]]
+    t = Table(count_row, colWidths=[1.35 * inch] * 5)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#101830")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#00F0FF")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#DEE2EA")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, 1), [colors.white]),
+    ]))
+    story.append(t)
+
+    story.append(Paragraph("Potentially Affected Systems", h2_style))
+    aff = doc.get("affected_systems") or []
+    rows = [["Host", "Tier", "Risk", "Conf", "Action", "Reason"]]
+    for h in aff[:16]:
+        rows.append([h.get("label", ""), h.get("tier", ""), h.get("risk", ""), f"{h.get('confidence', 0) * 100:.0f}%", h.get("action", ""), (h.get("reason", "") or "")[:72]])
+    ac_table = Table(rows, colWidths=[1.4 * inch, 0.95 * inch, 0.55 * inch, 0.5 * inch, 0.75 * inch, 2.7 * inch])
+    ac_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1020")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#DEE2EA")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F7FB")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(ac_table)
+
+    snap = doc.get("snapshot") or {}
+    rm = snap.get("response_metrics") or {}
+    story.append(Paragraph("Before / After Response Metrics", h2_style))
+    m_rows = [
+        ["Peak risk at detection", f"{rm.get('peak_risk_at_detection', 0) * 100:.0f}%"],
+        ["Peak risk at verify end", f"{rm.get('peak_risk_at_end', 0) * 100:.0f}%"],
+        ["Risk reduction", f"{rm.get('risk_reduction_pct', 0):.1f}%"],
+        ["Propagation stopped", "Yes" if rm.get("propagation_stopped") else "No"],
+        ["Cycles used", str(rm.get("cycles_used", "—"))],
+        ["Detection frame", f"F{rm.get('detection_frame', '?')}"],
+        ["Verification end frame", f"F{rm.get('verification_end_frame', '?')}"],
+    ]
+    mt = Table(m_rows, colWidths=[2.5 * inch, 4.35 * inch])
+    mt.setStyle(TableStyle([
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#DEE2EA")),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#F5F7FB")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(mt)
+
+    story.append(Paragraph("MITRE ATT&CK — Observed", h2_style))
+    mitre = (snap.get("mitre_active") or [])[:10]
+    if mitre:
+        m2 = [["ID", "Tactic", "Technique", "Conf"]] + [[m["id"], m["tactic"], m["name"], f"{m.get('conf', 0) * 100:.0f}%"] for m in mitre]
+        mt2 = Table(m2, colWidths=[0.8 * inch, 1.3 * inch, 3.55 * inch, 0.7 * inch])
+        mt2.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1020")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#DEE2EA")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F7FB")]),
+        ]))
+        story.append(mt2)
+    else:
+        story.append(Paragraph("No techniques observed at report generation time.", small))
+
+    story.append(Paragraph("Engineer Handoff — Investigate · Remediate · Recover", h2_style))
+    story.append(Paragraph(doc.get("engineer_action_required", ""), body))
+    story.append(Spacer(1, 0.06 * inch))
+    story.append(Paragraph("Simulated lab actions — no real endpoints were disconnected. Threat confidence values are policy-derived, not a separately trained ML probability.", small))
+
+    pdf.build(story)
+    return buf.getvalue()
+
+
+@app.get("/api/incidents/{incident_id}/pdf")
+async def incident_pdf(incident_id: str) -> Response:
+    doc = await db.incidents.find_one({"id": incident_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="incident not found")
+    data = _render_incident_pdf(doc)
+    safe_id = "".join(ch if ord(ch) < 128 else "_" for ch in incident_id)
+    filename = f"{safe_id}.pdf"
+    return Response(content=data, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{filename}"'})

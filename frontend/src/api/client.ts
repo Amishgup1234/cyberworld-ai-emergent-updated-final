@@ -121,6 +121,13 @@ export type IncidentState = {
 
 export type FrameStateWithIncident = FrameState & { incident: IncidentState };
 
+export type Cve = { id: string; title: string; severity: string; cvss: number; vector: string; kev: boolean; published: string; source: string };
+export type AsnRep = { asn: string; name: string; country: string; reputation: string; score: number; source: string };
+export type Ioc = { type: string; value: string; confidence: number; first_seen: string; source: string };
+export type NodeIntel = { node_id: string; scenario_id: string; cves: Cve[]; asns: AsnRep[]; iocs: Ioc[]; sources: string[]; fresh: boolean };
+
+export type Playbook = { id: string; name: string; match: { scenario_id?: string; scenario_family?: string }; thresholds: Partial<CareSettings>; auto_apply: boolean; created_at: string };
+
 export const api = {
   health: () => j<{ status: string; scenarios_loaded: number }>(`${BASE}/health`),
   listScenarios: () => j<ScenarioMeta[]>(`${BASE}/scenarios`),
@@ -138,4 +145,13 @@ export const api = {
   getCareSettings: () => j<CareSettings>(`${BASE}/care/settings`),
   putCareSettings: (patch: Partial<CareSettings>) =>
     j<CareSettings>(`${BASE}/care/settings`, { method: "PUT", body: JSON.stringify(patch) }),
+  getIntel: (scenario_id: string, node_id: string) =>
+    j<NodeIntel>(`${BASE}/scenarios/${encodeURIComponent(scenario_id)}/intel/${encodeURIComponent(node_id)}`),
+  listPlaybooks: () => j<Playbook[]>(`${BASE}/playbooks`),
+  createPlaybook: (payload: { name: string; match: Playbook['match']; thresholds: Playbook['thresholds']; auto_apply: boolean }) =>
+    j<Playbook>(`${BASE}/playbooks`, { method: "POST", body: JSON.stringify(payload) }),
+  deletePlaybook: (id: string) => j<{ deleted: string }>(`${BASE}/playbooks/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  matchPlaybook: (payload: { scenario_id: string; family: string }) =>
+    j<{ match: Playbook | null }>(`${BASE}/playbooks/match`, { method: "POST", body: JSON.stringify(payload) }),
+  incidentPdfUrl: (incident_id: string) => `${BASE}/incidents/${encodeURIComponent(incident_id)}/pdf`,
 };
